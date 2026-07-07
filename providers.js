@@ -216,7 +216,7 @@ async function sendChat({ config, messages, tools, onChunk, onToolCall, onRetry 
 
   const loopMessages = [...messages];
   let usage = null;
-  const maxIterations = 10;
+  const maxIterations = 50;
 
   for (let iteration = 0; iteration < maxIterations; iteration++) {
     let assistantText = '';
