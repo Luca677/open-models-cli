@@ -60,12 +60,88 @@ function buildDispatchTool(workerRoles) {
   };
 }
 
+// Ruflo-Vorbild (nested-coordinator): 2-stufige Hives -- ein Worker, den der Top-Coordinator
+// dispatcht (Tiefe 1), bekommt SELBST ebenfalls das dispatch_agents-Tool und kann seine
+// Teilaufgabe nochmal in kleinere Stuecke zerlegen. Tiefe 2 (von einem Tiefe-1-Worker
+// dispatchte Worker) bekommt das Tool NICHT MEHR -- reiner Leaf-Worker. Bewusst kleiner als
+// Ruflos Tiefe 5, um Kosten/Laufzeit nicht explodieren zu lassen. MAX_ASSIGNMENTS_PER_DISPATCH
+// gilt pro Dispatch-Aufruf auf JEDER Ebene (kein zusaetzlicher Multiplikator-Deckel noetig,
+// da jede Ebene schon einzeln gedeckelt ist).
+const MAX_HIVE_DEPTH = 2;
+
+// Ein einzelner Worker-Knoten im (moeglicherweise verschachtelten) Hive-Baum. `depth` zaehlt
+// von 1 (direkt vom Top-Coordinator dispatcht) aufwaerts. `counter` ist ein ueber den GANZEN
+// Baum geteiltes { n } Objekt (per Referenz durchgereicht) -- liefert eindeutige Worker-IDs
+// (nicht nur pro Rollenname, siehe Kommentar bei workerSeq weiter unten) auch ueber mehrere
+// Verschachtelungsebenen hinweg.
+async function runWorkerNode({ config, role, task, depth, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter }) {
+  const workerId = `${role.name}#${counter.n++}`;
+  onWorkerStart(role, task, workerId);
+  const workerConfig = { ...config, activeModel: role.model };
+  const baseTools = buildToolDefinitions(config.projectRoot, { readOnly: role.readOnly });
+  const canSubDispatch = depth < MAX_HIVE_DEPTH;
+  const dispatchTool = canSubDispatch ? buildDispatchTool(workerRoles) : null;
+  const tools = dispatchTool ? [dispatchTool, ...baseTools] : baseTools;
+
+  let text = '';
+  let toolCallHappened = false;
+  try {
+    await sendChat({
+      config: workerConfig,
+      messages: [
+        { role: 'system', content: role.systemPrompt },
+        fableSystemMessage(),
+        ...(projectContext ? [{ role: 'system', content: projectContext }] : []),
+        { role: 'user', content: task },
+      ],
+      tools,
+      onChunk: (delta) => { text += delta; },
+      onToolCall: async (toolCall) => {
+        toolCallHappened = true;
+        if (dispatchTool && toolCall.function.name === 'dispatch_agents') {
+          let args;
+          try {
+            args = JSON.parse(toolCall.function.arguments || '{}');
+          } catch {
+            return 'FEHLER: dispatch_agents Argumente nicht parsebar.';
+          }
+          const assignments = Array.isArray(args.assignments) ? args.assignments.slice(0, MAX_ASSIGNMENTS_PER_DISPATCH) : [];
+          if (!assignments.length) {
+            return 'FEHLER: keine gueltigen assignments uebergeben.';
+          }
+          const subOutcomes = await Promise.all(
+            assignments.map((a) => {
+              const subRole = workerRoles.find((r) => r.name === a.role);
+              if (!subRole) return Promise.resolve({ role: a.role, label: a.role, error: `Rolle "${a.role}" nicht gefunden.` });
+              return runWorkerNode({ config, role: subRole, task: a.task, depth: depth + 1, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter });
+            })
+          );
+          return subOutcomes
+            .map((o) => (o.error ? `[${o.label}] FEHLER: ${o.error}` : `[${o.label}] ${o.text}`))
+            .join('\n\n');
+        }
+        return onFileToolCall(toolCall);
+      },
+      onRetry,
+    });
+    if (!text.trim() && !toolCallHappened) {
+      const warning = 'LEER: Modell hat weder Text noch Tool-Aufrufe geliefert (moeglicher Modell-Aussetzer).';
+      onWorkerDone(role, text, warning, workerId);
+      return { role: role.name, label: role.label, error: warning };
+    }
+    onWorkerDone(role, text, null, workerId);
+    return { role: role.name, label: role.label, text };
+  } catch (err) {
+    const message = err.message || String(err);
+    onWorkerDone(role, '', message, workerId);
+    return { role: role.name, label: role.label, error: message };
+  }
+}
+
 // Coordinator-gefuehrter Schwarm (ruflo-swarm:coordinator-Vorbild): EIN Coordinator-Modell
 // zerlegt die Aufgabe und dispatcht per Tool-Call an beliebig viele Worker-Rollen PARALLEL
-// (Promise.all -- echte gleichzeitige HTTP-Requests, kein sequenzielles Abarbeiten). Die
-// Worker selbst bekommen KEIN dispatch_agents-Tool -- eine Verschachtelungsebene (Coordinator
-// -> Worker), kein rekursives Sub-Spawning. Das haelt Kosten/Komplexitaet planbar; bei Bedarf
-// liesse sich das spaeter erweitern (Worker duerften dann selbst re-dispatchen).
+// (Promise.all -- echte gleichzeitige HTTP-Requests, kein sequenzielles Abarbeiten). Jeder
+// dispatchte Worker kann seinerseits nochmal dispatchen (siehe runWorkerNode/MAX_HIVE_DEPTH).
 // ponytail: Bug, den ein echter Lauf aufgedeckt hat -- coordinatorToolCallHappened blieb
 // fuer die GESAMTE (mehrstufige) Coordinator-Unterhaltung auf true, sobald IRGENDEIN Tool-
 // Aufruf passiert war (z.B. ein exploratives list_directory ganz am Anfang). Als danach der
@@ -86,12 +162,14 @@ async function runHive({ config, task, coordinatorRole, workerRoles, buildToolDe
   let result = null;
   // Eindeutige ID pro Worker-INSTANZ (nicht pro Rollenname!) -- derselbe Rollenname (z.B.
   // "coder") kann in einem einzigen dispatch_agents-Aufruf mehrfach gleichzeitig vorkommen
-  // (mehrere Teilaufgaben an dieselbe Rolle) oder ueber einen Coordinator-Neustart hinweg
-  // erneut auftauchen. Ein Aufrufer (index.js), der z.B. einen Wartesymbol-Timer pro Worker
-  // fuehrt, braucht dafuer einen Schluessel, der NICHT einfach role.name ist -- sonst
-  // ueberschreibt eine zweite gleichnamige Rolle den Timer-Handle der ersten, ohne ihn zu
-  // stoppen (Leak: der alte Timer laeuft fuer immer weiter).
-  let workerSeq = 0;
+  // (mehrere Teilaufgaben an dieselbe Rolle), ueber Verschachtelungsebenen hinweg erneut
+  // auftauchen, oder ueber einen Coordinator-Neustart hinweg erneut auftauchen. Ein Aufrufer
+  // (index.js), der z.B. einen Wartesymbol-Timer pro Worker fuehrt, braucht dafuer einen
+  // Schluessel, der NICHT einfach role.name ist -- sonst ueberschreibt eine zweite gleichnamige
+  // Rolle den Timer-Handle der ersten, ohne ihn zu stoppen (Leak: der alte Timer laeuft fuer
+  // immer weiter). Als Objekt (nicht primitive Zahl) durchgereicht, damit runWorkerNode den
+  // Zaehler ueber beliebig viele Verschachtelungsebenen hinweg per Referenz weiterzaehlen kann.
+  const counter = { n: 0 };
 
   for (let attempt = 1; attempt <= MAX_COORDINATOR_ATTEMPTS && !dispatchHappened; attempt++) {
     onAgentStart(coordinatorRole);
@@ -136,46 +214,10 @@ async function runHive({ config, task, coordinatorRole, workerRoles, buildToolDe
         dispatchHappened = true;
 
         const outcomes = await Promise.all(
-          assignments.map(async (a) => {
+          assignments.map((a) => {
             const role = workerRoles.find((r) => r.name === a.role);
-            if (!role) {
-              return { role: a.role, label: a.role, error: `Rolle "${a.role}" nicht gefunden.` };
-            }
-            const workerId = `${role.name}#${workerSeq++}`;
-            onWorkerStart(role, a.task, workerId);
-            const workerConfig = { ...config, activeModel: role.model };
-            const workerTools = role.readOnly ? buildToolDefinitions(config.projectRoot, { readOnly: true }) : fileTools;
-            let text = '';
-            let toolCallHappened = false;
-            try {
-              await sendChat({
-                config: workerConfig,
-                messages: [
-                  { role: 'system', content: role.systemPrompt },
-                  fableSystemMessage(),
-                  ...(projectContext ? [{ role: 'system', content: projectContext }] : []),
-                  { role: 'user', content: a.task },
-                ],
-                tools: workerTools,
-                onChunk: (delta) => { text += delta; },
-                onToolCall: (toolCall) => {
-                  toolCallHappened = true;
-                  return onFileToolCall(toolCall);
-                },
-                onRetry,
-              });
-              if (!text.trim() && !toolCallHappened) {
-                const warning = 'LEER: Modell hat weder Text noch Tool-Aufrufe geliefert (moeglicher Modell-Aussetzer).';
-                onWorkerDone(role, text, warning, workerId);
-                return { role: role.name, label: role.label, error: warning };
-              }
-              onWorkerDone(role, text, null, workerId);
-              return { role: role.name, label: role.label, text };
-            } catch (err) {
-              const message = err.message || String(err);
-              onWorkerDone(role, '', message, workerId);
-              return { role: role.name, label: role.label, error: message };
-            }
+            if (!role) return Promise.resolve({ role: a.role, label: a.role, error: `Rolle "${a.role}" nicht gefunden.` });
+            return runWorkerNode({ config, role, task: a.task, depth: 1, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter });
           })
         );
 
