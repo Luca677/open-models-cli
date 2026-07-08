@@ -8,7 +8,7 @@ const { PROVIDERS, MODEL_PRESETS, loadConfig, saveConfig, sendChat, resolveTarge
 const { buildToolDefinitions: buildFileTools, WRITE_TOOLS, executeTool, undoLastWrite } = require('./tools');
 const { buildShellToolDefinitions, runCommand, readBackgroundOutput, checkDangerous, SHELL_WRITE_TOOLS } = require('./shell');
 const { AGENTS_DIR, loadAgentRoles, loadPipelineOrder } = require('./agents');
-const { runSwarm, runHive } = require('./swarm');
+const { runSwarm, runHive, runConsensusCheck } = require('./swarm');
 const { STYLES, styleSystemMessage } = require('./styles');
 const { EFFORT_LEVELS, effortMaxTokens, effortSystemMessage } = require('./effort');
 const { MCPClient, mcpToolDefinitions, isMcpTool, parseMcpTool } = require('./mcp');
@@ -1019,11 +1019,63 @@ async function runHiveCommand(task) {
       console.log(
         `\n${ANSI.dim}Hive fertig. (${workerCount} Worker gestartet, ${workerErrorCount} Fehler, ${retryCount} Retries, ${emptyTurnCount} leere Zuege${coordinatorRetries ? `, ${coordinatorRetries} Coordinator-Neustarts` : ''})${ANSI.reset}\n`
       );
-      const newFiles = [...touchedFiles].filter((f) => !beforeFiles.has(f));
+      let newFiles = [...touchedFiles].filter((f) => !beforeFiles.has(f));
+      let finalSummary = result.finalText || '(keine Textzusammenfassung)';
+
+      console.log(`${ANSI.dim}[Konsens] 3 unabhaengige Modelle pruefen das Ergebnis...${ANSI.reset}`);
+      const consensus = await runConsensusCheck({
+        config,
+        task,
+        files: newFiles,
+        buildToolDefinitions,
+        onFileToolCall: (tc) => handleToolCall(tc, { swarmMode: true }),
+        onRetry: printRetry,
+      });
+      for (const v of consensus.votes) {
+        console.log(`${ANSI.dim}[Konsens] ${v.model}: ${v.verdict} -- ${shorten(v.reason, 200)}${ANSI.reset}`);
+      }
+
+      if (!consensus.approved) {
+        console.log(`${ANSI.error}[Konsens] Mehrheit: NACHBESSERUNG -- ein zusaetzlicher Coordinator-Durchlauf mit dem Feedback startet.${ANSI.reset}`);
+        const feedback = consensus.votes.map((v) => `- ${v.model}: ${v.reason}`).join('\n');
+        const followupTask = `${task}\n\nHINWEIS: Eine unabhaengige Konsens-Pruefung durch 3 Modelle hat NACHBESSERUNG entschieden. Begruendungen:\n${feedback}\nBitte behebe das jetzt.`;
+        const beforeFollowup = new Set(touchedFiles);
+        try {
+          const followupResult = await runHive({
+            config,
+            task: followupTask,
+            coordinatorRole,
+            workerRoles,
+            buildToolDefinitions,
+            projectContext: buildAgentContext(config.projectRoot),
+            onAgentStart: (r) => console.log(`\n\n${ANSI.accent}${ANSI.bold}=== ${r.label} (${r.model}) [Nachbesserung] ===${ANSI.reset}`),
+            onChunk: (delta) => process.stdout.write(delta),
+            onWorkerStart: (role, t) => console.log(`\n${ANSI.accent}[Worker] ${role.label} startet (Nachbesserung): ${t}${ANSI.reset}`),
+            onWorkerDone: (role, text, error) =>
+              console.log(
+                error
+                  ? `${ANSI.error}[Worker] ${role.label} FEHLER: ${error}${ANSI.reset}`
+                  : `${ANSI.dim}[Worker] ${role.label} fertig.${ANSI.reset}`
+              ),
+            onFileToolCall: (tc) => handleToolCall(tc, { swarmMode: true }),
+            onRetry: printRetry,
+            onEmptyTurn: printEmptyTurn,
+          });
+          console.log(`\n${ANSI.dim}Nachbesserung abgeschlossen (kein weiterer Konsens-Check, um Pingpong zu vermeiden).${ANSI.reset}\n`);
+          const followupFiles = [...touchedFiles].filter((f) => !beforeFollowup.has(f));
+          newFiles = [...new Set([...newFiles, ...followupFiles])];
+          finalSummary = followupResult.finalText || finalSummary;
+        } catch (err) {
+          console.log(`${ANSI.error}[Konsens-Nachbesserung] fehlgeschlagen: ${err.message || err}${ANSI.reset}\n`);
+        }
+      } else {
+        console.log(`${ANSI.dim}[Konsens] Mehrheit: FERTIG.${ANSI.reset}\n`);
+      }
+
       appendProjectMemory(config.projectRoot, {
         task,
         files: newFiles,
-        summary: shorten(result.finalText || '(keine Textzusammenfassung)', 500),
+        summary: shorten(finalSummary, 500),
       });
     }
   } catch (err) {

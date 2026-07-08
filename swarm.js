@@ -329,4 +329,45 @@ async function runSwarm({ config, task, roles, buildToolDefinitions, onAgentStar
   return transcript;
 }
 
-module.exports = { runSwarm, runHive, SEND_MESSAGE_TOOL };
+// Hive-Mind-Konsens (Ruflo-Vorbild, vereinfacht auf 3 unabhaengige Read-only-Stimmen statt
+// vollem Byzantine-Konsens): nach einem erfolgreichen Hive-Lauf bewerten 3 unabhaengige,
+// PARALLELE Modell-Aufrufe (kein Panel-Teilnehmer der eigentlichen Arbeit, gegen Selbst-
+// Bevorzugung) die tatsaechlich veraenderten Dateien und stimmen FERTIG/NACHBESSERUNG ab.
+// Nur Lese-Tools (buildToolDefinitions mit readOnly:true) -- ein Richter darf nichts aendern.
+const CONSENSUS_JUDGE_MODELS = ['deepseek-v4', 'qwen-397b', 'kimi-k2.6'];
+
+async function runConsensusCheck({ config, task, files, buildToolDefinitions, onFileToolCall, onRetry }) {
+  const filesList = files.length ? files.join(', ') : '(keine Dateien erkannt)';
+  const prompt =
+    `Aufgabe war: ${task}\n\nFolgende Dateien wurden in diesem Lauf veraendert: ${filesList}\n\n` +
+    'Pruefe sie (list_directory/read_file) und entscheide, ob die Aufgabe FERTIG ist oder noch ' +
+    'NACHBESSERUNG braucht. Antworte in der ERSTEN Zeile nur mit genau einem Wort: FERTIG oder ' +
+    'NACHBESSERUNG. Danach in maximal 2 Saetzen die Begruendung.';
+
+  const votes = await Promise.all(
+    CONSENSUS_JUDGE_MODELS.map(async (modelKey) => {
+      const judgeConfig = { ...config, activeModel: modelKey };
+      let text = '';
+      try {
+        await sendChat({
+          config: judgeConfig,
+          messages: [{ role: 'user', content: prompt }],
+          tools: buildToolDefinitions(config.projectRoot, { readOnly: true }),
+          onChunk: (d) => { text += d; },
+          onToolCall: onFileToolCall,
+          onRetry,
+        });
+      } catch (err) {
+        text = `NACHBESSERUNG\n(Fehler beim Bewerten: ${err.message || err})`;
+      }
+      const firstLine = (text.trim().split('\n')[0] || '').toUpperCase();
+      const verdict = firstLine.includes('FERTIG') && !firstLine.includes('NACHBESSER') ? 'FERTIG' : 'NACHBESSERUNG';
+      return { model: modelKey, verdict, reason: text.trim() || '(keine Begruendung geliefert)' };
+    })
+  );
+
+  const approvals = votes.filter((v) => v.verdict === 'FERTIG').length;
+  return { approved: approvals >= 2, votes };
+}
+
+module.exports = { runSwarm, runHive, runConsensusCheck, SEND_MESSAGE_TOOL };
