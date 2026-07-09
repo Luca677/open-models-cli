@@ -422,6 +422,14 @@ function printEmptyTurn(role) {
   );
 }
 
+// Selbstdiagnose (modelHealth.js) hat entschieden, dass das Modell dieser Rolle zu oft
+// Retries/Fehler/Langsamkeit produziert -- fuer diesen Zug automatisch ersetzt.
+function printModelSwap(role, oldModel, newModel, reason) {
+  console.log(
+    `\n${ANSI.error}[Modell-Wechsel] ${role.label}: "${oldModel}" wirkt unzuverlaessig (${reason}) -- fuer diesen Zug ersetzt durch "${newModel}".${ANSI.reset}`
+  );
+}
+
 // ponytail: reine Keyword-Heuristik, kein gelerntes Routing -- reicht als grobe Empfehlung,
 // /model + eigenes Urteil bleiben massgeblich.
 function recommendModel(taskText) {
@@ -688,6 +696,7 @@ async function handleCommand(line) {
         },
         onRetry: (...a) => { stopWaiting(true); printRetry(...a); firstOutput = true; },
         onEmptyTurn: (r) => { stopWaiting(true); printEmptyTurn(r); },
+        onModelSwap: printModelSwap,
       });
       console.log(`\n${ANSI.dim}Fertig.${ANSI.reset}\n`);
       const newFiles = [...touchedFiles].filter((f) => !beforeFiles.has(f));
@@ -1081,6 +1090,7 @@ async function runSwarmCommand(task, opts = {}) {
       },
       onRetry: (...args) => { retryCount++; stopWaiting(true); printRetry(...args); firstOutput = true; },
       onEmptyTurn: (role) => { emptyTurnCount++; stopWaiting(true); printEmptyTurn(role); },
+      onModelSwap: printModelSwap,
     });
     console.log(`\n${ANSI.dim}Swarm fertig. (${turnCount} Zuege, ${retryCount} Retries, ${emptyTurnCount} leere Zuege)${ANSI.reset}\n`);
     const newFiles = [...touchedFiles].filter((f) => !beforeFiles.has(f));
@@ -1164,6 +1174,7 @@ async function runHiveCommand(task, opts = {}) {
       },
       onRetry: (...args) => { retryCount++; stopWaiting(true); printRetry(...args); firstOutput = true; },
       onEmptyTurn: (role) => { emptyTurnCount++; stopWaiting(true); printEmptyTurn(role); },
+      onModelSwap: printModelSwap,
       onCoordinatorRetry: (attempt) => {
         coordinatorRetries++;
         console.log(`\n${ANSI.error}[Coordinator-Neustart] Vorheriger Versuch hat keinen Worker gestartet -- Versuch ${attempt}...${ANSI.reset}`);
@@ -1223,6 +1234,7 @@ async function runHiveCommand(task, opts = {}) {
             onFileToolCall: fileToolCall,
             onRetry: printRetry,
             onEmptyTurn: printEmptyTurn,
+            onModelSwap: printModelSwap,
           });
           console.log(`\n${ANSI.dim}Nachbesserung abgeschlossen (kein weiterer Konsens-Check, um Pingpong zu vermeiden).${ANSI.reset}\n`);
           const followupFiles = [...touchedFiles].filter((f) => !beforeFollowup.has(f));

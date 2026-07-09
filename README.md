@@ -101,6 +101,20 @@ System-Kontext injiziert (CLAUDE.md-Aequivalent, nur Einzel-Chat). `/todo add|do
 sie zu loeschen, `/history search <begriff>` durchsucht das Archiv. Uebersprungen: volles
 typisiertes Memory-System, gleichzeitige benannte Sessions (Architektur-Mismatch), Wissensgraph.
 
+## Selbstdiagnose + automatischer Modell-Wechsel (modelHealth.js)
+
+Auf Nutzerwunsch: manche Modelle brauchen sehr lange oder werfen haeufig Fehler, was zu vielen
+Retries und viel verlorener Zeit fuehrt. `modelHealth.js` sammelt pro Modell-Preset (In-Memory,
+nicht persistiert) Retries/Fehler/Antwortzeit ueber die Laufzeit des Prozesses. Ab dem 2.
+Aufruf eines Modells wird geurteilt: >=50% Fehlerquote, >=1.5 Retries im Schnitt pro Aufruf,
+oder >=45s Antwortzeit im Schnitt gilt als unzuverlaessig/langsam. Betrifft das die naechste
+Rolle, die dieses Modell nutzen wuerde (Einzel-Agent, Swarm-Rolle, Hive-Coordinator/Worker auf
+jeder Verschachtelungstiefe), wird automatisch auf ein anderes Preset ausgewichen (bevorzugt
+ein bereits getestetes, gesundes Modell; sonst ein hart codierter Fallback-Pool) -- sichtbar
+per `[Modell-Wechsel]`-Hinweis. Zusaetzlich werfen einzelne Coordinator-/Rollen-Fehlschlaege
+jetzt nicht mehr den GESAMTEN Swarm/Hive-Lauf um, sondern werden wie ein leerer Zug behandelt
+und fliessen in die Diagnose ein.
+
 ## Fable-Layer, Gedaechtnis, Nested-Hives, Konsens, Loops (Phasen A-E, 2. Runde)
 
 Auf Nutzerwunsch nach echtem Praxiseinsatz (Kontext-Verlust zwischen Modellwechseln, kein

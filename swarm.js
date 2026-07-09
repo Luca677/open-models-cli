@@ -1,8 +1,9 @@
 'use strict';
 
-const { sendChat } = require('./providers');
+const { sendChat, MODEL_PRESETS } = require('./providers');
 const { styleSystemMessage } = require('./styles');
 const { fableSystemMessage } = require('./fable');
+const { recordAttempt, diagnose, pickReplacement } = require('./modelHealth');
 
 const SEND_MESSAGE_TOOL = {
   type: 'function',
@@ -23,6 +24,21 @@ const SEND_MESSAGE_TOOL = {
 
 function speakerTag(name, text) {
   return `[${name}]: ${text}`;
+}
+
+// Selbstdiagnose (modelHealth.js): wenn das der Rolle zugewiesene Modell sich bereits als
+// unzuverlaessig/langsam erwiesen hat, fuer DIESEN Zug automatisch auf ein anderes Preset
+// ausweichen, statt erneut eine lange Retry-Kette zu riskieren. onModelSwap benachrichtigt
+// den Aufrufer (index.js), damit der Nutzer sieht, dass/warum gewechselt wurde.
+function pickEffectiveModel(role, onModelSwap) {
+  const diag = diagnose(role.model);
+  if (!diag.unhealthy) return role.model;
+  const replacement = pickReplacement(role.model, Object.keys(MODEL_PRESETS));
+  if (replacement !== role.model) {
+    onModelSwap(role, role.model, replacement, diag.reason);
+    return replacement;
+  }
+  return role.model;
 }
 
 // ponytail: max. Assignments pro dispatch_agents-Aufruf gedeckelt -- verhindert, dass ein
@@ -74,10 +90,11 @@ const MAX_HIVE_DEPTH = 2;
 // Baum geteiltes { n } Objekt (per Referenz durchgereicht) -- liefert eindeutige Worker-IDs
 // (nicht nur pro Rollenname, siehe Kommentar bei workerSeq weiter unten) auch ueber mehrere
 // Verschachtelungsebenen hinweg.
-async function runWorkerNode({ config, role, task, depth, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter }) {
+async function runWorkerNode({ config, role, task, depth, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter, onModelSwap = () => {} }) {
   const workerId = `${role.name}#${counter.n++}`;
   onWorkerStart(role, task, workerId);
-  const workerConfig = { ...config, activeModel: role.model };
+  const effectiveModel = pickEffectiveModel(role, onModelSwap);
+  const workerConfig = { ...config, activeModel: effectiveModel };
   const baseTools = buildToolDefinitions(config.projectRoot, { readOnly: role.readOnly });
   const canSubDispatch = depth < MAX_HIVE_DEPTH;
   const dispatchTool = canSubDispatch ? buildDispatchTool(workerRoles) : null;
@@ -85,6 +102,8 @@ async function runWorkerNode({ config, role, task, depth, workerRoles, buildTool
 
   let text = '';
   let toolCallHappened = false;
+  let workerRetries = 0;
+  const startMs = Date.now();
   try {
     await sendChat({
       config: workerConfig,
@@ -113,7 +132,7 @@ async function runWorkerNode({ config, role, task, depth, workerRoles, buildTool
             assignments.map((a) => {
               const subRole = workerRoles.find((r) => r.name === a.role);
               if (!subRole) return Promise.resolve({ role: a.role, label: a.role, error: `Rolle "${a.role}" nicht gefunden.` });
-              return runWorkerNode({ config, role: subRole, task: a.task, depth: depth + 1, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter });
+              return runWorkerNode({ config, role: subRole, task: a.task, depth: depth + 1, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter, onModelSwap });
             })
           );
           return subOutcomes
@@ -122,8 +141,9 @@ async function runWorkerNode({ config, role, task, depth, workerRoles, buildTool
         }
         return onFileToolCall(toolCall);
       },
-      onRetry,
+      onRetry: (...a) => { workerRetries++; onRetry(...a); },
     });
+    recordAttempt(effectiveModel, { retries: workerRetries, errored: false, durationMs: Date.now() - startMs });
     if (!text.trim() && !toolCallHappened) {
       const warning = 'LEER: Modell hat weder Text noch Tool-Aufrufe geliefert (moeglicher Modell-Aussetzer).';
       onWorkerDone(role, text, warning, workerId);
@@ -132,6 +152,7 @@ async function runWorkerNode({ config, role, task, depth, workerRoles, buildTool
     onWorkerDone(role, text, null, workerId);
     return { role: role.name, label: role.label, text };
   } catch (err) {
+    recordAttempt(effectiveModel, { retries: workerRetries, errored: true, durationMs: Date.now() - startMs });
     const message = err.message || String(err);
     onWorkerDone(role, '', message, workerId);
     return { role: role.name, label: role.label, error: message };
@@ -153,7 +174,7 @@ async function runWorkerNode({ config, role, task, depth, workerRoles, buildTool
 // stillschweigend mit 0 Workern abzuschliessen.
 const MAX_COORDINATOR_ATTEMPTS = 2;
 
-async function runHive({ config, task, coordinatorRole, workerRoles, buildToolDefinitions, onAgentStart, onChunk, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, onEmptyTurn = () => {}, onCoordinatorRetry = () => {}, projectContext = null }) {
+async function runHive({ config, task, coordinatorRole, workerRoles, buildToolDefinitions, onAgentStart, onChunk, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, onEmptyTurn = () => {}, onCoordinatorRetry = () => {}, onModelSwap = () => {}, projectContext = null }) {
   const dispatchTool = buildDispatchTool(workerRoles);
   // Coordinator bekommt volle Datei-Tools (er delegiert primaer, kann aber selbst nachschauen).
   const fileTools = buildToolDefinitions(config.projectRoot);
@@ -174,7 +195,8 @@ async function runHive({ config, task, coordinatorRole, workerRoles, buildToolDe
   for (let attempt = 1; attempt <= MAX_COORDINATOR_ATTEMPTS && !dispatchHappened; attempt++) {
     onAgentStart(coordinatorRole);
 
-    const coordinatorConfig = { ...config, activeModel: coordinatorRole.model };
+    const effectiveModel = pickEffectiveModel(coordinatorRole, onModelSwap);
+    const coordinatorConfig = { ...config, activeModel: effectiveModel };
     const coordinatorMessages = [
       { role: 'system', content: coordinatorRole.systemPrompt },
       fableSystemMessage(),
@@ -190,42 +212,52 @@ async function runHive({ config, task, coordinatorRole, workerRoles, buildToolDe
     }
 
     let coordinatorToolCallHappened = false;
-    result = await sendChat({
-      config: coordinatorConfig,
-      messages: coordinatorMessages,
-      tools: [dispatchTool, ...fileTools],
-      onChunk,
-      onRetry,
-      onToolCall: async (toolCall) => {
-        coordinatorToolCallHappened = true;
-        if (toolCall.function.name !== 'dispatch_agents') {
-          return onFileToolCall(toolCall);
-        }
-        let args;
-        try {
-          args = JSON.parse(toolCall.function.arguments || '{}');
-        } catch {
-          return 'FEHLER: dispatch_agents Argumente nicht parsebar.';
-        }
-        const assignments = Array.isArray(args.assignments) ? args.assignments.slice(0, MAX_ASSIGNMENTS_PER_DISPATCH) : [];
-        if (!assignments.length) {
-          return 'FEHLER: keine gueltigen assignments uebergeben.';
-        }
-        dispatchHappened = true;
+    let coordinatorRetries = 0;
+    const startMs = Date.now();
+    try {
+      result = await sendChat({
+        config: coordinatorConfig,
+        messages: coordinatorMessages,
+        tools: [dispatchTool, ...fileTools],
+        onChunk,
+        onRetry: (...a) => { coordinatorRetries++; onRetry(...a); },
+        onToolCall: async (toolCall) => {
+          coordinatorToolCallHappened = true;
+          if (toolCall.function.name !== 'dispatch_agents') {
+            return onFileToolCall(toolCall);
+          }
+          let args;
+          try {
+            args = JSON.parse(toolCall.function.arguments || '{}');
+          } catch {
+            return 'FEHLER: dispatch_agents Argumente nicht parsebar.';
+          }
+          const assignments = Array.isArray(args.assignments) ? args.assignments.slice(0, MAX_ASSIGNMENTS_PER_DISPATCH) : [];
+          if (!assignments.length) {
+            return 'FEHLER: keine gueltigen assignments uebergeben.';
+          }
+          dispatchHappened = true;
 
-        const outcomes = await Promise.all(
-          assignments.map((a) => {
-            const role = workerRoles.find((r) => r.name === a.role);
-            if (!role) return Promise.resolve({ role: a.role, label: a.role, error: `Rolle "${a.role}" nicht gefunden.` });
-            return runWorkerNode({ config, role, task: a.task, depth: 1, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter });
-          })
-        );
+          const outcomes = await Promise.all(
+            assignments.map((a) => {
+              const role = workerRoles.find((r) => r.name === a.role);
+              if (!role) return Promise.resolve({ role: a.role, label: a.role, error: `Rolle "${a.role}" nicht gefunden.` });
+              return runWorkerNode({ config, role, task: a.task, depth: 1, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter, onModelSwap });
+            })
+          );
 
-        return outcomes
-          .map((o) => (o.error ? `[${o.label}] FEHLER: ${o.error}` : `[${o.label}] ${o.text}`))
-          .join('\n\n');
-      },
-    });
+          return outcomes
+            .map((o) => (o.error ? `[${o.label}] FEHLER: ${o.error}` : `[${o.label}] ${o.text}`))
+            .join('\n\n');
+        },
+      });
+      recordAttempt(effectiveModel, { retries: coordinatorRetries, errored: false, durationMs: Date.now() - startMs });
+    } catch (err) {
+      // Nicht die ganze Hive abbrechen -- als leerer Zug behandeln (loest im naechsten
+      // Versuch automatisch einen Modell-Wechsel aus, falls das Muster sich wiederholt).
+      recordAttempt(effectiveModel, { retries: coordinatorRetries, errored: true, durationMs: Date.now() - startMs });
+      result = { finalText: '', usage: null, provider: '', model: effectiveModel };
+    }
 
     if (!result.finalText.trim() && !coordinatorToolCallHappened) {
       onEmptyTurn(coordinatorRole);
@@ -250,7 +282,7 @@ function maxTotalTurns(roleCount) {
 // tatsaechlich einen weiteren Zug, statt dass die Nachricht ungelesen verpufft).
 // buildToolDefinitions/onFileToolCall kommen vom Aufrufer (index.js), damit swarm.js nichts
 // ueber Pfad-Sandboxing oder die Bestaetigungs-UI wissen muss.
-async function runSwarm({ config, task, roles, buildToolDefinitions, onAgentStart, onChunk, onNotice, onFileToolCall, onRetry, onEmptyTurn = () => {}, projectContext = null }) {
+async function runSwarm({ config, task, roles, buildToolDefinitions, onAgentStart, onChunk, onNotice, onFileToolCall, onRetry, onEmptyTurn = () => {}, onModelSwap = () => {}, projectContext = null }) {
   const transcript = [{ role: 'user', content: `Team-Aufgabe: ${task}` }];
   const mailbox = {};
   const turnQueue = [...roles];
@@ -276,39 +308,51 @@ async function runSwarm({ config, task, roles, buildToolDefinitions, onAgentStar
       { role: 'user', content: `Du bist jetzt am Zug (Rolle: ${role.label}). Nutze die Datei-Tools falls fuer deine Rolle noetig.` },
     ];
 
-    const roleConfig = { ...config, activeModel: role.model };
+    const effectiveModel = pickEffectiveModel(role, onModelSwap);
+    const roleConfig = { ...config, activeModel: effectiveModel };
     const tools = [...buildToolDefinitions(config.projectRoot, { readOnly: role.readOnly }), SEND_MESSAGE_TOOL];
 
     let finalText = '';
     let toolCallHappened = false;
+    let roleRetries = 0;
     const wakeups = new Set();
-    await sendChat({
-      config: roleConfig,
-      messages: roleMessages,
-      tools,
-      onChunk: (delta) => {
-        finalText += delta;
-        onChunk(delta);
-      },
-      onRetry,
-      onToolCall: async (toolCall) => {
-        toolCallHappened = true;
-        if (toolCall.function.name === 'send_message') {
-          let args;
-          try {
-            args = JSON.parse(toolCall.function.arguments || '{}');
-          } catch {
-            return 'FEHLER: send_message Argumente nicht parsebar.';
+    const startMs = Date.now();
+    try {
+      await sendChat({
+        config: roleConfig,
+        messages: roleMessages,
+        tools,
+        onChunk: (delta) => {
+          finalText += delta;
+          onChunk(delta);
+        },
+        onRetry: (...a) => { roleRetries++; onRetry(...a); },
+        onToolCall: async (toolCall) => {
+          toolCallHappened = true;
+          if (toolCall.function.name === 'send_message') {
+            let args;
+            try {
+              args = JSON.parse(toolCall.function.arguments || '{}');
+            } catch {
+              return 'FEHLER: send_message Argumente nicht parsebar.';
+            }
+            if (!mailbox[args.to]) mailbox[args.to] = [];
+            mailbox[args.to].push({ from: role.name, content: args.content });
+            wakeups.add(args.to);
+            onNotice(`${role.label} -> ${args.to}: ${args.content}`);
+            return `OK: Nachricht an ${args.to} eingereiht.`;
           }
-          if (!mailbox[args.to]) mailbox[args.to] = [];
-          mailbox[args.to].push({ from: role.name, content: args.content });
-          wakeups.add(args.to);
-          onNotice(`${role.label} -> ${args.to}: ${args.content}`);
-          return `OK: Nachricht an ${args.to} eingereiht.`;
-        }
-        return onFileToolCall(toolCall);
-      },
-    });
+          return onFileToolCall(toolCall);
+        },
+      });
+      recordAttempt(effectiveModel, { retries: roleRetries, errored: false, durationMs: Date.now() - startMs });
+    } catch (err) {
+      // Nicht den ganzen Schwarm abbrechen -- als leerer Zug behandeln, Diagnose merkt sich
+      // den Fehlschlag (fuehrt bei Wiederholung zum automatischen Modell-Wechsel).
+      recordAttempt(effectiveModel, { retries: roleRetries, errored: true, durationMs: Date.now() - startMs });
+      finalText = '';
+      toolCallHappened = false;
+    }
 
     if (!finalText.trim() && !toolCallHappened) {
       onEmptyTurn(role);
