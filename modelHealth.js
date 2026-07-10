@@ -106,29 +106,48 @@ function diagnose(modelKey) {
   return { unhealthy: false, reason: null };
 }
 
-// Hart codierte Ausweich-Modelle, falls noch kein anderer Kandidat in dieser Sitzung
-// getestet und als gesund bekannt ist (z.B. gleich der allererste Zug schlaegt schon fehl).
-const FALLBACK_POOL = ['nemotron-super', 'gpt-oss-120b', 'kimi-k2.6', 'nemotron-nano9b'];
-
-// ponytail: Bug, den ein echter Langzeit-Lauf aufgedeckt hat -- der Fallback-Zweig schloss
-// nur currentModelKey aus, NICHT bereits bekannte unhealthy Kandidaten. Ein Modell, das
-// gerade erst als Ersatz diagnostiziert unhealthy wurde (z.B. Tageskontingent erschoepft),
-// wurde dadurch als "Fallback" trotzdem IMMER WIEDER gewaehlt -- Endlos-Pingpong zwischen
-// genau zwei kaputten Modellen statt Durchprobieren aller verfuegbaren Presets. Fix: sowohl
-// der getrackte Pfad als auch der Fallback-Pool schliessen JEDES bekannt unhealthy Modell
-// aus, nicht nur das urspruengliche. Bleibt am Ende nichts Gesundes uebrig (z.B. weil wirklich
-// alle Presets gerade limitiert sind), lieber IRGENDEIN anderes Modell probieren als stur
-// beim bekannt kaputten currentModelKey zu bleiben.
+// ponytail: 2. Bug, den ein echter Langzeit-Lauf aufgedeckt hat -- der LETZTE Fallback-Zweig
+// (wenn weder ein getrackt-gesundes Modell noch der hart codierte FALLBACK_POOL uebrig war)
+// pickte bisher blind candidateKeys.find(k => k !== currentModelKey) -- ignoriert dabei
+// KOMPLETT, ob dieses Modell selbst schon als unhealthy bekannt ist. Da Object.keys(MODEL_PRESETS)
+// mit 'deepseek-v4' beginnt, landete in einem Lauf mit vielen gleichzeitig limitierten Modellen
+// (mehrere Provider-Ausfaelle/Rate-Limits) am Ende IMMER 'deepseek-v4' -- selbst wenn genau DAS
+// Modell Sekunden zuvor selbst als zu langsam/unhealthy diagnostiziert und ersetzt wurde. Fix:
+// EIN einziger Kandidaten-Pool (alle candidateKeys statt eines separaten 4er-Hardcode-Pools) --
+// zuerst bevorzugt getestet+gesund (schnellstes zuerst), sonst irgendein noch NIE getestetes
+// (unbekannt ist besser als bekannt kaputt), und NUR wenn wirklich ALLES bekannt unhealthy ist,
+// das mit der niedrigsten Fehlerquote -- nie mehr blinde Array-Reihenfolge.
 function pickReplacement(currentModelKey, candidateKeys) {
   const isUsable = (k) => k !== currentModelKey && !diagnose(k).unhealthy;
-  const healthyTracked = candidateKeys
-    .filter((k) => isUsable(k) && stats.has(k))
-    .sort((a, b) => stats.get(a).totalMs / stats.get(a).calls - stats.get(b).totalMs / stats.get(b).calls);
-  if (healthyTracked.length) return healthyTracked[0];
-  const fallback = FALLBACK_POOL.find(isUsable);
-  if (fallback) return fallback;
-  const anyOther = candidateKeys.find((k) => k !== currentModelKey);
-  return anyOther || currentModelKey;
+  const usable = candidateKeys.filter(isUsable);
+  if (usable.length) {
+    const tested = usable
+      .filter((k) => stats.has(k))
+      .sort((a, b) => stats.get(a).totalMs / stats.get(a).calls - stats.get(b).totalMs / stats.get(b).calls);
+    return tested[0] || usable[0];
+  }
+  const others = candidateKeys.filter((k) => k !== currentModelKey);
+  if (!others.length) return currentModelKey;
+  reloadFromDisk();
+  // Alle drei Diagnose-Dimensionen normiert auf ihre eigene Unhealthy-Schwelle summieren (nicht
+  // nur Fehlerquote allein) -- sonst wuerde z.B. ein Modell mit 0 Fehlern aber 300s Antwortzeit
+  // faelschlich als "bestes" gelten. permanent (Kontingent/Tageslimit) wird ganz gemieden, so
+  // lange noch ein anderer, nur transient schlechter Kandidat uebrig ist.
+  const score = (s) => (s.errors / s.calls) / UNHEALTHY_ERROR_RATE
+    + (s.retries / s.calls) / UNHEALTHY_RETRY_RATIO
+    + (s.totalMs / s.calls) / SLOW_MS_THRESHOLD;
+  let best = others[0];
+  let bestScore = Infinity;
+  for (const k of others) {
+    const s = stats.get(k);
+    if (s?.permanent) continue;
+    const candidateScore = s ? score(s) : 0; // ungetestet = neutral, nicht "unendlich schlecht"
+    if (candidateScore < bestScore) {
+      bestScore = candidateScore;
+      best = k;
+    }
+  }
+  return best;
 }
 
 module.exports = { recordAttempt, diagnose, pickReplacement };
