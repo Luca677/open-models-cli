@@ -209,6 +209,34 @@ function isRetryable(err) {
 const MAX_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 1000;
 
+// Aufrufer (index.js/swarm.js) bauen die Nachrichtenliste aus mehreren UNABHAENGIGEN Quellen
+// zusammen (Rollen-Prompt, Fable-Qualitaets-Layer, Projekt-Kontext/Gedaechtnis, Stil) -- jede
+// eine eigene { role: 'system', ... }-Nachricht. Reale Auswirkung eines echten Langzeit-Laufs:
+// manche Modell-Server-Templates (hier qwen-397b via NIM) akzeptieren strikt NUR EINE System-
+// Nachricht an Position 0 und lehnen mit HTTP 500 "System message must be at the beginning"
+// ab, sobald eine zweite folgt -- kein Zuverlässigkeitsproblem des Modells, sondern ein
+// Formatfehler unsererseits, den JEDES gleich strenge Modell reproduzieren wuerde. Fix hier
+// zentral (nicht an jeder Aufrufstelle einzeln): alle FUEHRENDEN System-Nachrichten zu einer
+// einzigen zusammenfassen, bevor sie rausgehen -- deckt automatisch alle Aufrufer ab.
+function mergeLeadingSystemMessages(messages) {
+  const systemParts = [];
+  const rest = [];
+  let pastLeadingSystem = false;
+  for (const m of messages) {
+    if (!pastLeadingSystem && m.role === 'system') {
+      if (m.content) systemParts.push(m.content);
+    } else {
+      pastLeadingSystem = true;
+      rest.push(m);
+    }
+  }
+  // Immer eine NEUE Array-Referenz zurueckgeben (nie die des Aufrufers) -- sendChat haengt
+  // spaeter Tool-Call-/Tool-Result-Nachrichten an loopMessages an; ohne eigene Kopie wuerde
+  // das sonst je nach Fall das Original-Array des Aufrufers unbemerkt mitveraendern.
+  if (systemParts.length <= 1) return [...messages];
+  return [{ role: 'system', content: systemParts.join('\n\n') }, ...rest];
+}
+
 async function sendChat({ config, messages, tools, onChunk, onToolCall, onRetry = () => {}, maxTokens = 8192, maxRetries = MAX_RETRIES }) {
   const target = resolveTarget(config);
   if (!target.baseUrl) {
@@ -218,7 +246,7 @@ async function sendChat({ config, messages, tools, onChunk, onToolCall, onRetry 
     throw new Error(`Kein API-Key fuer ${target.providerLabel} gesetzt (/setkey ${target.provider} <key>).`);
   }
 
-  const loopMessages = [...messages];
+  const loopMessages = mergeLeadingSystemMessages(messages);
   let usage = null;
   const maxIterations = 50;
 
