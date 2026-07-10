@@ -101,6 +101,19 @@ System-Kontext injiziert (CLAUDE.md-Aequivalent, nur Einzel-Chat). `/todo add|do
 sie zu loeschen, `/history search <begriff>` durchsucht das Archiv. Uebersprungen: volles
 typisiertes Memory-System, gleichzeitige benannte Sessions (Architektur-Mismatch), Wissensgraph.
 
+## "LEERE" Zuege diagnostizierbar machen (finish_reason/reasoningChars)
+
+Auf Nutzerwunsch nach dem Bug-Report "Worker scheitern extrem haeufig": haeufigste Ursache war
+`finish_reason: "length"` -- das Token-Budget (`SWARM_MAX_TOKENS`, war auf 'medium'/4096 gesenkt)
+reichte bei den eingesetzten Reasoning-Modellen (deepseek-v4/qwen-397b/kimi-k2.6/glm-5) oft nicht
+mehr fuer sichtbaren Text/Tool-Aufruf, weil die interne Gedankenkette (`delta.reasoning_content`)
+einen Teil davon vorher aufbraucht -- providers.js hat dieses Feld bisher stillschweigend
+ignoriert. Jetzt: `streamOpenAICompatible`/`sendChat` erfassen `finish_reason` und die Anzahl
+verbrauchter Reasoning-Zeichen, `[Warnung]`-Meldungen bei leeren Zuegen zeigen das direkt an
+(z.B. "finish_reason: length, 1200 Zeichen interne Gedankenkette verbraucht" statt nur
+"moeglicher Modell-Aussetzer"). `SWARM_MAX_TOKENS` wieder auf 'high'/8192 angehoben -- ein
+leerer Zug kostet durch Retry/Modell-Wechsel am Ende mehr Zeit als das hoehere Budget spart.
+
 ## Selbstdiagnose + automatischer Modell-Wechsel (modelHealth.js)
 
 Auf Nutzerwunsch: manche Modelle brauchen sehr lange oder werfen haeufig Fehler, was zu vielen

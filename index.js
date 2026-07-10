@@ -436,9 +436,9 @@ function printRetry(err, attempt, maxRetries, delayMs) {
 // Ein Zug ohne Text UND ohne Tool-Aufruf sieht sonst aus wie ein Haenger, ist aber nur ein
 // stiller Modell-Aussetzer (leere Antwort) -- explizit sichtbar machen statt kommentarlos
 // weiterzugehen.
-function printEmptyTurn(role) {
+function printEmptyTurn(role, detail = '') {
   console.log(
-    `\n${ANSI.error}[Warnung] ${role.label} hat nichts geliefert (weder Text noch Tool-Aufruf) -- moeglicher Modell-Aussetzer.${ANSI.reset}`
+    `\n${ANSI.error}[Warnung] ${role.label} hat nichts geliefert (weder Text noch Tool-Aufruf)${detail || ' -- moeglicher Modell-Aussetzer'}.${ANSI.reset}`
   );
 }
 
@@ -841,7 +841,7 @@ async function handleCommand(line) {
           return handleToolCall(toolCall, { swarmMode: true });
         },
         onRetry: (...a) => { stopWaiting(true); printRetry(...a); firstOutput = true; },
-        onEmptyTurn: (r) => { stopWaiting(true); printEmptyTurn(r); },
+        onEmptyTurn: (r, detail) => { stopWaiting(true); printEmptyTurn(r, detail); },
         onModelSwap: printModelSwap,
       });
       console.log(`\n${ANSI.dim}Fertig.${ANSI.reset}\n`);
@@ -1238,7 +1238,7 @@ async function runSwarmCommand(task, opts = {}) {
         return fileToolCall(toolCall);
       },
       onRetry: (...args) => { retryCount++; stopWaiting(true); printRetry(...args); firstOutput = true; },
-      onEmptyTurn: (role) => { emptyTurnCount++; stopWaiting(true); printEmptyTurn(role); },
+      onEmptyTurn: (role, detail) => { emptyTurnCount++; stopWaiting(true); printEmptyTurn(role, detail); },
       onModelSwap: printModelSwap,
     });
     console.log(`\n${ANSI.dim}Swarm fertig. (${turnCount} Zuege, ${retryCount} Retries, ${emptyTurnCount} leere Zuege) -- Trace-ID: ${transcript.runId} (Details: /trace ${transcript.runId})${ANSI.reset}\n`);
@@ -1322,7 +1322,7 @@ async function runHiveCommand(task, opts = {}) {
         return fileToolCall(toolCall);
       },
       onRetry: (...args) => { retryCount++; stopWaiting(true); printRetry(...args); firstOutput = true; },
-      onEmptyTurn: (role) => { emptyTurnCount++; stopWaiting(true); printEmptyTurn(role); },
+      onEmptyTurn: (role, detail) => { emptyTurnCount++; stopWaiting(true); printEmptyTurn(role, detail); },
       onModelSwap: printModelSwap,
       onCoordinatorRetry: (attempt) => {
         coordinatorRetries++;

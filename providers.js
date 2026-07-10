@@ -174,6 +174,8 @@ async function* streamOpenAICompatible({ baseUrl, apiKey, model, messages, maxTo
   const decoder = new TextDecoder();
   let buffer = '';
   let usage = null;
+  let finishReason = null;
+  let reasoningChars = 0;
   const toolCalls = [];
 
   while (true) {
@@ -195,9 +197,18 @@ async function* streamOpenAICompatible({ baseUrl, apiKey, model, messages, maxTo
         continue;
       }
       if (parsed.usage) usage = parsed.usage;
-      const delta = parsed.choices?.[0]?.delta;
+      const choice = parsed.choices?.[0];
+      if (choice?.finish_reason) finishReason = choice.finish_reason;
+      const delta = choice?.delta;
       if (!delta) continue;
       if (delta.content) yield { type: 'text', text: delta.content };
+      // Reasoning-Modelle (DeepSeek/Qwen/Kimi/GLM ueber NIM) senden ihre interne Gedankenkette
+      // oft in einem EIGENEN Feld (reasoning_content/reasoning), NICHT in delta.content -- zaehlt
+      // aber genauso gegen max_tokens. Nur mitgezaehlt (nicht angezeigt), damit sich bei einer
+      // leeren SICHTBAREN Antwort unterscheiden laesst: "Budget ging fuers Denken drauf, bevor
+      // sichtbarer Text/Tool-Aufruf kam" vs. "Modell hat wirklich nichts geliefert".
+      const reasoningDelta = delta.reasoning_content || delta.reasoning;
+      if (reasoningDelta) reasoningChars += reasoningDelta.length;
       if (delta.tool_calls) {
         for (const tc of delta.tool_calls) {
           const i = tc.index ?? 0;
@@ -209,7 +220,7 @@ async function* streamOpenAICompatible({ baseUrl, apiKey, model, messages, maxTo
       }
     }
   }
-  yield { type: 'done', usage, toolCalls: toolCalls.filter(Boolean) };
+  yield { type: 'done', usage, toolCalls: toolCalls.filter(Boolean), finishReason, reasoningChars };
 }
 
 // onChunk(text) streamt die sichtbare Antwort. onToolCall(toolCall) fuehrt EIN Tool aus
@@ -272,6 +283,8 @@ async function sendChat({ config, messages, tools, onChunk, onToolCall, onRetry 
 
   const loopMessages = mergeLeadingSystemMessages(messages);
   let usage = null;
+  let finishReason = null;
+  let reasoningChars = 0;
   const maxIterations = 50;
 
   for (let iteration = 0; iteration < maxIterations; iteration++) {
@@ -296,6 +309,8 @@ async function sendChat({ config, messages, tools, onChunk, onToolCall, onRetry 
           } else if (chunk.type === 'done') {
             usage = chunk.usage;
             toolCalls = chunk.toolCalls;
+            finishReason = chunk.finishReason;
+            reasoningChars = chunk.reasoningChars;
           }
         }
         break;
@@ -322,7 +337,7 @@ async function sendChat({ config, messages, tools, onChunk, onToolCall, onRetry 
     }
 
     if (!toolCalls.length) {
-      return { provider: target.providerLabel, model: target.model, usage, finalText: assistantText };
+      return { provider: target.providerLabel, model: target.model, usage, finalText: assistantText, finishReason, reasoningChars };
     }
 
     loopMessages.push({ role: 'assistant', content: assistantText || null, tool_calls: toolCalls });

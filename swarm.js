@@ -7,15 +7,22 @@ const { recordAttempt, diagnose, pickReplacement } = require('./modelHealth');
 const { effortMaxTokens } = require('./effort');
 const trace = require('./trace');
 
-// Zeiteffizienz in Swarm/Hive: (1) weniger Retries pro Modell-Aufruf als im Einzel-Chat --
-// bei einem schlechten Modell lohnt sich hier nicht das volle Warten (1s/2s/4s Backoff, bis
-// zu 3x), weil modelHealth.js ohnehin auf ein anderes Preset ausweicht, sobald sich ein
-// Muster zeigt. (2) niedrigerer Token-Deckel als der globale /effort-Standard ("high" =
-// 8192) -- bei parallelen Multi-Agent-Laeufen bringt sehr ausfuehrliches Ausformulieren pro
-// einzelnem Zug wenig zusaetzlichen Wert, kostet aber Zeit. Beides unabhaengig vom globalen
-// /effort-Setting (das bleibt ausschliesslich fuer den Einzel-Chat massgeblich).
+// Zeiteffizienz in Swarm/Hive: weniger Retries pro Modell-Aufruf als im Einzel-Chat -- bei
+// einem schlechten Modell lohnt sich hier nicht das volle Warten (1s/2s/4s Backoff, bis zu
+// 3x), weil modelHealth.js ohnehin auf ein anderes Preset ausweicht, sobald sich ein Muster
+// zeigt. Unabhaengig vom globalen /effort-Setting (das bleibt ausschliesslich fuer den
+// Einzel-Chat massgeblich).
 const SWARM_MAX_RETRIES = 1;
-const SWARM_MAX_TOKENS = effortMaxTokens('medium');
+// ponytail: Bug, den ein echter Lauf aufgedeckt hat -- war auf 'medium' (4096) gesenkt, um
+// pro Zug Zeit zu sparen. Fast alle Presets (deepseek-v4/qwen-397b/kimi-k2.6/glm-5) sind
+// aber Reasoning-Modelle, die einen Teil ihres max_tokens-Budgets fuer eine interne, nicht
+// sichtbare Gedankenkette verbrauchen (delta.reasoning_content, siehe providers.js), BEVOR
+// sichtbarer Text/Tool-Aufruf kommt -- bei 4096 reichte das Budget bei komplexeren Coordinator-
+// /Worker-Aufgaben oft nicht mehr fuer den sichtbaren Teil, das Ergebnis war eine "LEERE"
+// Antwort (weder Text noch Tool-Aufruf). Ein leerer Zug kostet am Ende MEHR Zeit (Retry/
+// Modell-Wechsel/Coordinator-Neustart) als das hoehere Budget gespart haette -- Zeit sparen
+// war der urspruengliche Grund fuer 'medium', aber leere Zuege sind netto langsamer.
+const SWARM_MAX_TOKENS = effortMaxTokens('high');
 
 const SEND_MESSAGE_TOOL = {
   type: 'function',
@@ -36,6 +43,17 @@ const SEND_MESSAGE_TOOL = {
 
 function speakerTag(name, text) {
   return `[${name}]: ${text}`;
+}
+
+// Macht eine leere Antwort (weder Text noch Tool-Aufruf) diagnostizierbar statt nur "moeglicher
+// Modell-Aussetzer" zu raten: finish_reason:"length" + reasoningChars>0 heisst konkret "Budget
+// ging fuers Denken drauf, bevor sichtbarer Output kam" (siehe SWARM_MAX_TOKENS-Kommentar oben).
+function describeEmptyTurn(chatResult) {
+  if (!chatResult) return '';
+  const parts = [];
+  if (chatResult.finishReason) parts.push(`finish_reason: ${chatResult.finishReason}`);
+  if (chatResult.reasoningChars) parts.push(`${chatResult.reasoningChars} Zeichen interne Gedankenkette verbraucht`);
+  return parts.length ? ` (${parts.join(', ')})` : '';
 }
 
 // Selbstdiagnose (modelHealth.js): wenn das der Rolle zugewiesene Modell sich bereits als
@@ -141,8 +159,9 @@ async function runWorkerNode({ config, role, task, depth, workerRoles, buildTool
   let toolCallHappened = false;
   let workerRetries = 0;
   const startMs = Date.now();
+  let chatResult = null;
   try {
-    await sendChat({
+    chatResult = await sendChat({
       config: workerConfig,
       messages: [
         { role: 'system', content: role.systemPrompt },
@@ -194,8 +213,8 @@ async function runWorkerNode({ config, role, task, depth, workerRoles, buildTool
       errorMessage: isEmpty ? 'leere Antwort (kein Text, kein Tool-Aufruf)' : '',
     });
     if (isEmpty) {
-      const warning = 'LEER: Modell hat weder Text noch Tool-Aufrufe geliefert (moeglicher Modell-Aussetzer).';
-      trace.logEvent(runId, 'worker_empty', { workerId, role: role.name, model: effectiveModel });
+      const warning = `LEER: Modell hat weder Text noch Tool-Aufrufe geliefert${describeEmptyTurn(chatResult)}.`;
+      trace.logEvent(runId, 'worker_empty', { workerId, role: role.name, model: effectiveModel, finishReason: chatResult?.finishReason, reasoningChars: chatResult?.reasoningChars });
       onWorkerDone(role, text, warning, workerId);
       return { role: role.name, label: role.label, error: warning };
     }
@@ -330,7 +349,7 @@ async function runHive({ config, task, coordinatorRole, workerRoles, buildToolDe
         durationMs: Date.now() - startMs,
         errorMessage: isEmpty ? 'leere Antwort (kein Text, kein Tool-Aufruf)' : '',
       });
-      if (isEmpty) onEmptyTurn(coordinatorRole);
+      if (isEmpty) onEmptyTurn(coordinatorRole, describeEmptyTurn(result));
     } catch (err) {
       // Nicht die ganze Hive abbrechen -- als leerer Zug behandeln (loest im naechsten
       // Versuch automatisch einen Modell-Wechsel aus, falls das Muster sich wiederholt).
@@ -400,8 +419,9 @@ async function runSwarm({ config, task, roles, buildToolDefinitions, onAgentStar
     let roleRetries = 0;
     const wakeups = new Set();
     const startMs = Date.now();
+    let chatResult = null;
     try {
-      await sendChat({
+      chatResult = await sendChat({
         config: roleConfig,
         messages: roleMessages,
         tools,
@@ -452,8 +472,8 @@ async function runSwarm({ config, task, roles, buildToolDefinitions, onAgentStar
     }
 
     if (!finalText.trim() && !toolCallHappened) {
-      trace.logEvent(runId, 'empty_turn', { role: role.name, model: effectiveModel });
-      onEmptyTurn(role);
+      trace.logEvent(runId, 'empty_turn', { role: role.name, model: effectiveModel, finishReason: chatResult?.finishReason, reasoningChars: chatResult?.reasoningChars });
+      onEmptyTurn(role, describeEmptyTurn(chatResult));
     }
 
     transcript.push({ role: 'assistant', content: speakerTag(role.label, finalText) });
