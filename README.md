@@ -147,6 +147,40 @@ probiert. Zustand liegt in `key-health.json` (Key nur als Hash, nie im Klartext)
 gleichzeitig laufende CLI-Instanzen sich denselben Key-Pool teilen, ohne sich gegenseitig zu
 ueberschreiben.
 
+## Kosten-Sichtbarkeit, Terminal-UX, smarteres Routing (4. Runde)
+
+Auf Nutzerwunsch nach einer weiteren "grossen Verbesserungsrunde" -- 3 Themenbloecke priorisiert
+(Crash-Resilience war schon durch den bestehenden `uncaughtException`-Handler abgedeckt, siehe
+Robustheit unten).
+
+**Kosten/Pre-Flight:** `/usage` zaehlte bisher NUR Einzel-Chat -- `/agent`/`/swarm`/`/hive`
+(inkl. verschachtelter Hive-Worker) summieren ihre Token-Nutzung jetzt in einem eigenen
+`usageTotals`-Objekt (analog zum bestehenden `counter`-Referenz-Muster fuer Worker-IDs) und
+fliessen nach Abschluss in `/usage` mit ein. Vor jedem `/swarm`/`/hive`-Start ein `[Vorab-Check]`,
+falls beteiligte Rollen-Modelle bereits als unzuverlaessig markiert sind (rein informativ --
+`pickEffectiveModel` weicht ohnehin automatisch aus, hier nur Sichtbarkeit VOR statt WAEHREND
+des Laufs).
+
+**Terminal-UX:** Bestaetigungsfragen bei `write_file`/`edit_file`/`run_command`/MCP-Tools zeigen
+jetzt `[1] Einmal erlauben [2] Immer erlauben [3] Ablehnen` statt nur y/N -- "Immer erlauben"
+setzt `toolPermissions[tool]='allow'` direkt (wie `/permission`). ponytail: bewusst nummerierte
+Textauswahl statt echtem Pfeiltasten-Menu -- Letzteres braucht TTY-Raw-Mode-Keypress-Events, die
+mit der bestehenden Frage-Queue (gebaut fuer gleichzeitige Bestaetigungsfragen paralleler
+Hive-Worker) kollidieren wuerden. Vor `write_file`/`edit_file`-Bestaetigungen erscheint jetzt
+zusaetzlich eine Diff-Vorschau (-/+ Zeilen, gemeinsamer Praefix/Suffix rausgekuerzt -- bei
+`edit_file` direkt aus old_string/new_string, bei `write_file` gegen den aktuellen Datei-Inhalt).
+Eine kurze Statuszeile (`[Modell @ Anbieter | Effort X | N Key(s)]`) erscheint jetzt vor jeder
+Eingabezeile. `/undo` kennt jetzt bis zu 5 Schritte pro Datei statt nur 1 (Ring-Puffer).
+
+**Smarteres Routing:** Keys sind pro PROVIDER eingetragen (nicht pro Preset) -- alle NIM-Presets
+(deepseek-v4/qwen-397b/kimi-k2.6/glm-5) teilen sich also denselben Key-Pool. `pickReplacement`
+bevorzugt jetzt Kandidaten auf einem Provider MIT nicht-erschoepftem Key, statt blind irgendein
+anderes Preset zu waehlen, das am Ende denselben limitierten Provider-Key trifft. Die
+`dispatch_agents`-Batch-Groesse (frueher fix 10) skaliert jetzt analog zur Hive-Tiefe mit der
+Anzahl eingetragener Keys (`swarm.js:recommendBatchSize`: 1-2 Keys -> 5, 3-5 -> 8, 6+ -> 10,
+weiterhin hart gedeckelt bei 10 -- der Deckel war immer ein Kostenschutz, keine reine
+Performance-Zahl).
+
 ## Tracing, semantische Projekt-Suche, konfigurierbare Hive-Tiefe (3. Ruflo-Runde)
 
 Auf Nutzerwunsch nach einem konkreten Bug-Report (ein Modell wurde durch ein Sekunden zuvor
@@ -209,15 +243,19 @@ technischen Schutz vor `rm -rf`/`format`/`git push --force`.
 ## Claude Code CLI vs. Terminal-Profil -- Nutzerkomfort (Stand nach Phase 1-8)
 
 Zweite Vergleichsrunde, diesmal NICHT nach rohen Faehigkeiten sortiert, sondern nach dem, was
-den Alltag beim Tippen/Lesen angenehmer macht. Nichts davon ist umgesetzt -- reine Liste fuer
-eine spaetere Entscheidung, was sich lohnt.
+den Alltag beim Tippen/Lesen angenehmer macht. Ursprungsliste fuer eine spaetere Entscheidung,
+was sich lohnt -- Punkte 2/3/9/11 inzwischen (teilweise) umgesetzt, siehe jeweilige Notiz.
 
 1. **Markdown-Rendering** -- fett/kursiv/Listen/Code-Bloecke mit Syntax-Highlighting im Ausgabe-
    Stream. Hier: reiner Text-Stream, Sternchen/Backticks bleiben sichtbare Zeichen.
-2. **Diff-Ansicht bei Edits** -- farbige +/- Zeilen wie `git diff`. Hier: nur die gekuerzte
-   old_string/new_string-Anzeige aus Phase-9-Kuerzung, kein echtes Zeilen-Diff.
+2. **Diff-Ansicht bei Edits** -- farbige +/- Zeilen wie `git diff`. Teilweise umgesetzt (4. Runde):
+   Praefix/Suffix-gekuerzte -/+ Zeilenvorschau vor jeder write_file/edit_file-Bestaetigung, aber
+   kein echtes LCS-Diff und keine ANSI-Farben (nur `ANSI.dim`).
 3. **Interaktive Bestaetigungs-UI** -- Pfeiltasten-Menue (Allow once/Always/Reject) pro Tool-Aufruf.
-   Hier: reine y/N-Texteingabe (und im Swarm/Hive jetzt oft gar keine Nachfrage mehr, siehe Phase 9).
+   Teilweise umgesetzt (4. Runde): nummerierte 3-Wege-Auswahl (1/2/3) statt echtem Pfeiltasten-
+   Menue -- Letzteres braucht TTY-Raw-Mode-Keypress-Events, die mit der bestehenden Frage-Queue
+   fuer parallele Hive-Bestaetigungen kollidieren wuerden (und im Swarm/Hive jetzt oft gar keine
+   Nachfrage mehr, siehe Phase 9).
 4. **Tastenkuerzel** -- Doppel-Esc fuer Verlauf zurueckspulen, Shift+Tab fuer Modus-Wechsel,
    Strg+R fuer Bash-History-Suche. Hier: nur Enter zum Absenden + Tab-Completion (Phase 7).
 5. **Spinner mit rotierendem Zeichen** waehrend des Wartens. Hier: Sekunden-Heartbeat-Text
@@ -228,11 +266,14 @@ eine spaetere Entscheidung, was sich lohnt.
    vervollstaendigt Pfade, zeigt aber keine Vorschau-Liste waehrend des Tippens an.
 8. **Strukturierte Fehlermeldungen** (z.B. mit Link zur Doku, eingeordneter Statuscode-Text).
    Hier: rohe `err.message`-Ausgabe des jeweiligen Anbieters.
-9. **Mehrere Undo-/Checkpoint-Stufen** pro Datei. Hier: `/undo` kennt nur EINEN Schritt zurueck.
+9. **Mehrere Undo-/Checkpoint-Stufen** pro Datei. Umgesetzt (4. Runde): `/undo` kennt jetzt bis
+   zu 5 Schritte zurueck (Ring-Puffer, siehe oben).
 10. **Erststart-Assistent** (fragt Projekt-Typ/Berechtigungen ab). Hier: direkter Rohstart,
     Banner zeigt nur den erkannten Projekt-Typ an, fragt aber nichts ab.
-11. **Live-Statusleiste** (Branch, Modell, Kontext-Auslastung staendig sichtbar). Hier: Infos
-    nur einmalig im Start-Banner, danach muessen `/usage`/`/settings` explizit aufgerufen werden.
+11. **Live-Statusleiste** (Branch, Modell, Kontext-Auslastung staendig sichtbar). Teilweise
+    umgesetzt (4. Runde): Modell/Anbieter/Effort/Key-Anzahl vor jeder Eingabezeile, aber
+    reprinted statt echt "live gepinnt" -- ANSI-Cursor-Region-Redraw ist je nach Terminal
+    unterschiedlich zuverlaessig, ein Reprint erreicht denselben Informationsgewinn ohne das Risiko.
 12. **Verlaufssuche mit Vorschau/Sprung zur Stelle**. Hier: `/history search` gibt nur einen
     Text-Dump der Treffer aus, kein Sprung in die Original-Session.
 13. **Mehrere parallele Sessions/Tabs** im selben Fenster. Hier: ein einzelner Prozess, eine

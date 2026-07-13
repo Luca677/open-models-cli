@@ -2,8 +2,9 @@
 
 const fs = require('fs');
 const path = require('path');
-const { CONFIG_PATH } = require('./providers');
+const { CONFIG_PATH, MODEL_PRESETS } = require('./providers');
 const { isQuotaMessage } = require('./errorClassify');
+const { isExhausted } = require('./keyPool');
 
 // Selbstdiagnose: sammelt pro Modell-Preset, wie oft es Retries braucht, wie oft es am Ende
 // trotzdem fehlschlaegt und wie lange es im Schnitt dauert. Ziel: Rollen, deren zugewiesenes
@@ -117,14 +118,34 @@ function diagnose(modelKey) {
 // zuerst bevorzugt getestet+gesund (schnellstes zuerst), sonst irgendein noch NIE getestetes
 // (unbekannt ist besser als bekannt kaputt), und NUR wenn wirklich ALLES bekannt unhealthy ist,
 // das mit der niedrigsten Fehlerquote -- nie mehr blinde Array-Reihenfolge.
-function pickReplacement(currentModelKey, candidateKeys) {
+// Keys sind pro PROVIDER eingetragen, nicht pro Preset (siehe keyPool.js) -- alle NIM-Presets
+// (deepseek-v4/qwen-397b/kimi-k2.6/glm-5) teilen sich also denselben Key-Pool. Ein Modell-
+// Wechsel innerhalb desselben limitierten Providers bringt nichts. hasLiveKey prueft, ob der
+// Provider dieses Presets AKTUELL mindestens einen nicht-erschoepften Key hat -- ohne config
+// (Rueckwaertskompatibel fuer Aufrufer, die noch keine config durchreichen) wird nichts gefiltert.
+function hasLiveKey(presetKey, config) {
+  if (!config) return true;
+  const preset = MODEL_PRESETS[presetKey];
+  if (!preset) return true;
+  const keys = (config.keys && config.keys[preset.provider]) || [];
+  const usableKeys = keys.filter((k) => k && k.trim());
+  if (!usableKeys.length) return true; // kein Key eingetragen ist ein anderes Problem als "limitiert"
+  return usableKeys.some((k) => !isExhausted(preset.provider, k));
+}
+
+function pickReplacement(currentModelKey, candidateKeys, config = null) {
   const isUsable = (k) => k !== currentModelKey && !diagnose(k).unhealthy;
   const usable = candidateKeys.filter(isUsable);
   if (usable.length) {
-    const tested = usable
+    // Kandidaten auf Providern MIT lebendigem Key bevorzugen -- nur wenn das die Auswahl nicht
+    // komplett leerraeumt (dann lieber ein moeglicherweise noch limitierter Kandidat als gar
+    // keiner, der naechste Request probiert es einfach erneut).
+    const withLiveKey = usable.filter((k) => hasLiveKey(k, config));
+    const pool = withLiveKey.length ? withLiveKey : usable;
+    const tested = pool
       .filter((k) => stats.has(k))
       .sort((a, b) => stats.get(a).totalMs / stats.get(a).calls - stats.get(b).totalMs / stats.get(b).calls);
-    return tested[0] || usable[0];
+    return tested[0] || pool[0];
   }
   const others = candidateKeys.filter((k) => k !== currentModelKey);
   if (!others.length) return currentModelKey;
@@ -136,9 +157,11 @@ function pickReplacement(currentModelKey, candidateKeys) {
   const score = (s) => (s.errors / s.calls) / UNHEALTHY_ERROR_RATE
     + (s.retries / s.calls) / UNHEALTHY_RETRY_RATIO
     + (s.totalMs / s.calls) / SLOW_MS_THRESHOLD;
-  let best = others[0];
+  const withLiveKeyOthers = others.filter((k) => hasLiveKey(k, config));
+  const scorePool = withLiveKeyOthers.length ? withLiveKeyOthers : others;
+  let best = scorePool[0];
   let bestScore = Infinity;
-  for (const k of others) {
+  for (const k of scorePool) {
     const s = stats.get(k);
     if (s?.permanent) continue;
     const candidateScore = s ? score(s) : 0; // ungetestet = neutral, nicht "unendlich schlecht"

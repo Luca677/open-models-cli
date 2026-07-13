@@ -120,29 +120,78 @@ function grepSearch(root, scopeRelPath, pattern, globFilter, caseInsensitive) {
   return results.join('\n') + suffix;
 }
 
-// Ein-Versions-Undo pro Datei (nicht mehrstufig -- ponytail: reicht, um einen einzelnen
-// KI-Fehler rueckgaengig zu machen, kein volles Versionsverwaltungssystem). `null` als
-// gespeicherter Inhalt bedeutet "Datei existierte vorher nicht", Undo loescht sie dann.
+// Mehrstufiges Undo pro Datei (Ring gedeckelt bei UNDO_STACK_LIMIT -- ponytail: kein volles
+// Versionsverwaltungssystem, nur genug Tiefe fuer mehrere aufeinanderfolgende KI-Fehler in
+// derselben Datei). `null` als gespeicherter Inhalt bedeutet "Datei existierte vorher nicht",
+// Undo loescht sie dann. Jeder /undo-Aufruf springt genau einen Schritt zurueck (letzter zuerst).
+const UNDO_STACK_LIMIT = 5;
 const undoHistory = new Map();
 
 function pushUndo(absPath) {
   const previous = fs.existsSync(absPath) ? fs.readFileSync(absPath, 'utf-8') : null;
-  undoHistory.set(absPath, previous);
+  const stack = undoHistory.get(absPath) || [];
+  stack.push(previous);
+  if (stack.length > UNDO_STACK_LIMIT) stack.shift();
+  undoHistory.set(absPath, stack);
 }
 
 function undoLastWrite(root, relPath) {
   const absPath = resolveSafe(root, relPath);
-  if (!undoHistory.has(absPath)) {
+  const stack = undoHistory.get(absPath);
+  if (!stack || !stack.length) {
     throw new Error(`Keine Undo-Historie fuer "${relPath}" in dieser Sitzung.`);
   }
-  const previous = undoHistory.get(absPath);
-  undoHistory.delete(absPath);
+  const previous = stack.pop();
+  const remaining = stack.length;
+  if (!remaining) undoHistory.delete(absPath);
+  const remainingNote = remaining ? ` (noch ${remaining} weitere Undo-Schritt(e) verfuegbar)` : '';
   if (previous === null) {
     fs.unlinkSync(absPath);
-    return `OK: ${relPath} rueckgaengig gemacht (Datei existierte vorher nicht, geloescht).`;
+    return `OK: ${relPath} rueckgaengig gemacht (Datei existierte vorher nicht, geloescht).${remainingNote}`;
   }
   fs.writeFileSync(absPath, previous, 'utf-8');
-  return `OK: ${relPath} auf vorherigen Stand zurueckgesetzt.`;
+  return `OK: ${relPath} auf vorherigen Stand zurueckgesetzt.${remainingNote}`;
+}
+
+// Diff-Vorschau vor write_file/edit_file-Bestaetigungen: gemeinsamer Praefix/Suffix wird
+// rausgekuerzt, nur der tatsaechlich veraenderte Mittelblock als -/+ gezeigt (kein volles
+// LCS-Diff noetig -- ponytail: bei edit_file ist die Aenderung durch old_string/new_string
+// ohnehin schon exakt bekannt, bei write_file reicht Praefix/Suffix-Kuerzung fuer den
+// ueblichen Fall "ein Abschnitt mittendrin geaendert").
+function diffPreview(oldText, newText, maxLines = 20) {
+  const oldLines = (oldText || '').split('\n');
+  const newLines = (newText || '').split('\n');
+  let start = 0;
+  while (start < oldLines.length && start < newLines.length && oldLines[start] === newLines[start]) start++;
+  let endOld = oldLines.length - 1;
+  let endNew = newLines.length - 1;
+  while (endOld >= start && endNew >= start && oldLines[endOld] === newLines[endNew]) {
+    endOld--;
+    endNew--;
+  }
+  const removed = oldLines.slice(start, endOld + 1);
+  const added = newLines.slice(start, endNew + 1);
+  if (!removed.length && !added.length) return '(keine Aenderung)';
+  const lines = [...removed.slice(0, maxLines).map((l) => `- ${l}`), ...added.slice(0, maxLines).map((l) => `+ ${l}`)];
+  const truncated = removed.length > maxLines || added.length > maxLines;
+  return lines.join('\n') + (truncated ? '\n... (gekuerzt)' : '');
+}
+
+function previewDiff(root, name, args) {
+  if (name === 'edit_file') {
+    return diffPreview(args.old_string || '', args.new_string || '');
+  }
+  if (name === 'write_file') {
+    let absPath;
+    try {
+      absPath = resolveSafe(root, args.path);
+    } catch {
+      return null;
+    }
+    const oldContent = fs.existsSync(absPath) ? fs.readFileSync(absPath, 'utf-8') : '';
+    return diffPreview(oldContent, args.content || '');
+  }
+  return null;
 }
 
 function buildToolDefinitions(root, { readOnly = false } = {}) {
@@ -309,4 +358,4 @@ function executeTool(root, name, args) {
   throw new Error(`Unbekanntes Tool: ${name}`);
 }
 
-module.exports = { buildToolDefinitions, WRITE_TOOLS, executeTool, resolveSafe, undoLastWrite };
+module.exports = { buildToolDefinitions, WRITE_TOOLS, executeTool, resolveSafe, undoLastWrite, previewDiff };

@@ -60,10 +60,10 @@ function describeEmptyTurn(chatResult) {
 // unzuverlaessig/langsam erwiesen hat, fuer DIESEN Zug automatisch auf ein anderes Preset
 // ausweichen, statt erneut eine lange Retry-Kette zu riskieren. onModelSwap benachrichtigt
 // den Aufrufer (index.js), damit der Nutzer sieht, dass/warum gewechselt wurde.
-function pickEffectiveModel(role, onModelSwap, runId = null) {
+function pickEffectiveModel(role, onModelSwap, runId = null, config = null) {
   const diag = diagnose(role.model);
   if (!diag.unhealthy) return role.model;
-  const replacement = pickReplacement(role.model, Object.keys(MODEL_PRESETS));
+  const replacement = pickReplacement(role.model, Object.keys(MODEL_PRESETS), config);
   if (replacement !== role.model) {
     trace.logEvent(runId, 'model_swap', { role: role.name, from: role.model, to: replacement, reason: diag.reason });
     onModelSwap(role, role.model, replacement, diag.reason);
@@ -75,17 +75,20 @@ function pickEffectiveModel(role, onModelSwap, runId = null) {
 // ponytail: max. Assignments pro dispatch_agents-Aufruf gedeckelt -- verhindert, dass ein
 // Coordinator-Modell versehentlich 50 parallele Calls in einer Runde auslöst (Kostenexplosion).
 // Braucht der Coordinator mehr Worker als das Limit, ruft er dispatch_agents einfach in einer
-// weiteren Runde erneut auf (sendChat erlaubt bis zu 10 Tool-Iterationen).
-const MAX_ASSIGNMENTS_PER_DISPATCH = 10;
+// weiteren Runde erneut auf (sendChat erlaubt bis zu 10 Tool-Iterationen). Absoluter Deckel
+// bleibt BATCH_SIZE_CAP -- der war immer ein bewusster Kostenschutz, keine reine Performance-
+// Zahl, die mit mehr Keys beliebig hochskaliert werden sollte (siehe recommendBatchSize unten).
+const BATCH_SIZE_CAP = 10;
+const BATCH_SIZE_DEFAULT = 5;
 
-function buildDispatchTool(workerRoles) {
+function buildDispatchTool(workerRoles, batchSize = BATCH_SIZE_DEFAULT) {
   return {
     type: 'function',
     function: {
       name: 'dispatch_agents',
       description:
         `Verteilt Teilaufgaben parallel an Worker-Agenten. Verfuegbare Rollen: ${workerRoles.map((r) => `"${r.name}" (${r.label})`).join(', ')}. ` +
-        `Max. ${MAX_ASSIGNMENTS_PER_DISPATCH} Assignments pro Aufruf -- fuer mehr: dispatch_agents in einer weiteren Runde erneut aufrufen.`,
+        `Max. ${batchSize} Assignments pro Aufruf -- fuer mehr: dispatch_agents in einer weiteren Runde erneut aufrufen.`,
       parameters: {
         type: 'object',
         properties: {
@@ -111,8 +114,8 @@ function buildDispatchTool(workerRoles) {
 // dispatcht (Tiefe 1), bekommt SELBST ebenfalls das dispatch_agents-Tool und kann seine
 // Teilaufgabe nochmal in kleinere Stuecke zerlegen, bis zur konfigurierten Tiefe. Bewusst mit
 // hartem Deckel bei Ruflos Tiefe 5, um Kosten/Laufzeit nicht explodieren zu lassen (Tiefe*
-// MAX_ASSIGNMENTS_PER_DISPATCH waechst multiplikativ). MAX_ASSIGNMENTS_PER_DISPATCH gilt pro
-// Dispatch-Aufruf auf JEDER Ebene (kein zusaetzlicher Multiplikator-Deckel noetig).
+// Batch-Groesse waechst multiplikativ). recommendBatchSize(config) gilt pro Dispatch-Aufruf
+// auf JEDER Ebene (kein zusaetzlicher Multiplikator-Deckel noetig).
 //
 // Auf Nutzerwunsch konfigurierbar statt fix 2: mehr eingetragene API-Keys (siehe keyPool.js)
 // bedeuten weniger Rate-Limit-Risiko bei mehr gleichzeitigen Requests, also ist eine groessere
@@ -122,12 +125,9 @@ const HIVE_DEPTH_CAP = 5;
 const HIVE_DEPTH_DEFAULT = 2;
 
 function recommendHiveDepth(config) {
-  const totalKeys = Object.values(config.keys || {}).reduce((sum, list) => {
-    const arr = Array.isArray(list) ? list : (list ? [list] : []);
-    return sum + arr.filter((k) => k && k.trim()).length;
-  }, 0);
-  if (totalKeys >= 6) return 4;
-  if (totalKeys >= 3) return 3;
+  const keys = totalKeyCount(config);
+  if (keys >= 6) return 4;
+  if (keys >= 3) return 3;
   return HIVE_DEPTH_DEFAULT;
 }
 
@@ -137,22 +137,39 @@ function effectiveHiveDepth(config) {
   return Math.min(recommendHiveDepth(config), HIVE_DEPTH_CAP);
 }
 
+// Auf Nutzerwunsch analog zu recommendHiveDepth: mehr eingetragene Keys erlauben mehr
+// gleichzeitige Requests, ohne dass ein einzelner Provider-Key das Rate-Limit sofort reisst.
+// Bleibt unter BATCH_SIZE_CAP (der bewusste Kostendeckel, siehe Kommentar bei der Konstante).
+function totalKeyCount(config) {
+  return Object.values(config.keys || {}).reduce((sum, list) => {
+    const arr = Array.isArray(list) ? list : (list ? [list] : []);
+    return sum + arr.filter((k) => k && k.trim()).length;
+  }, 0);
+}
+
+function recommendBatchSize(config) {
+  const keys = totalKeyCount(config);
+  if (keys >= 6) return BATCH_SIZE_CAP;
+  if (keys >= 3) return 8;
+  return BATCH_SIZE_DEFAULT;
+}
+
 // Ein einzelner Worker-Knoten im (moeglicherweise verschachtelten) Hive-Baum. `depth` zaehlt
 // von 1 (direkt vom Top-Coordinator dispatcht) aufwaerts. `counter` ist ein ueber den GANZEN
 // Baum geteiltes { n } Objekt (per Referenz durchgereicht) -- liefert eindeutige Worker-IDs
 // (nicht nur pro Rollenname, siehe Kommentar bei workerSeq weiter unten) auch ueber mehrere
 // Verschachtelungsebenen hinweg.
-async function runWorkerNode({ config, role, task, depth, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter, onModelSwap = () => {}, runId = null }) {
+async function runWorkerNode({ config, role, task, depth, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter, onModelSwap = () => {}, runId = null, usageTotals = { promptTokens: 0, completionTokens: 0, calls: 0 } }) {
   const workerId = `${role.name}#${counter.n++}`;
   // pickEffectiveModel VOR onWorkerStart, damit die Anzeige das TATSAECHLICH verwendete
   // (evtl. per Selbstdiagnose ersetzte) Modell zeigt statt immer role.model.
-  const effectiveModel = pickEffectiveModel(role, onModelSwap, runId);
+  const effectiveModel = pickEffectiveModel(role, onModelSwap, runId, config);
   onWorkerStart({ ...role, model: effectiveModel }, task, workerId);
   trace.logEvent(runId, 'worker_start', { workerId, role: role.name, depth, model: effectiveModel });
   const workerConfig = { ...config, activeModel: effectiveModel };
   const baseTools = buildToolDefinitions(config.projectRoot, { readOnly: role.readOnly });
   const canSubDispatch = depth < effectiveHiveDepth(config);
-  const dispatchTool = canSubDispatch ? buildDispatchTool(workerRoles) : null;
+  const dispatchTool = canSubDispatch ? buildDispatchTool(workerRoles, recommendBatchSize(config)) : null;
   const tools = dispatchTool ? [dispatchTool, ...baseTools] : baseTools;
 
   let text = '';
@@ -180,7 +197,7 @@ async function runWorkerNode({ config, role, task, depth, workerRoles, buildTool
           } catch {
             return 'FEHLER: dispatch_agents Argumente nicht parsebar.';
           }
-          const assignments = Array.isArray(args.assignments) ? args.assignments.slice(0, MAX_ASSIGNMENTS_PER_DISPATCH) : [];
+          const assignments = Array.isArray(args.assignments) ? args.assignments.slice(0, recommendBatchSize(config)) : [];
           if (!assignments.length) {
             return 'FEHLER: keine gueltigen assignments uebergeben.';
           }
@@ -188,7 +205,7 @@ async function runWorkerNode({ config, role, task, depth, workerRoles, buildTool
             assignments.map((a) => {
               const subRole = workerRoles.find((r) => r.name === a.role);
               if (!subRole) return Promise.resolve({ role: a.role, label: a.role, error: `Rolle "${a.role}" nicht gefunden.` });
-              return runWorkerNode({ config, role: subRole, task: a.task, depth: depth + 1, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter, onModelSwap, runId });
+              return runWorkerNode({ config, role: subRole, task: a.task, depth: depth + 1, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter, onModelSwap, runId, usageTotals });
             })
           );
           return subOutcomes
@@ -202,6 +219,11 @@ async function runWorkerNode({ config, role, task, depth, workerRoles, buildTool
       maxTokens: SWARM_MAX_TOKENS,
       runId,
     });
+    if (chatResult && chatResult.usage) {
+      usageTotals.promptTokens += chatResult.usage.prompt_tokens || 0;
+      usageTotals.completionTokens += chatResult.usage.completion_tokens || 0;
+      usageTotals.calls += 1;
+    }
     const isEmpty = !text.trim() && !toolCallHappened;
     // Leere Antwort (HTTP 200, aber weder Text noch Tool-Aufruf) zaehlt jetzt als Fehler fuer
     // die Selbstdiagnose -- sonst wird ein Modell, das zuverlaessig leer statt mit echtem
@@ -247,7 +269,8 @@ const MAX_COORDINATOR_ATTEMPTS = 2;
 
 async function runHive({ config, task, coordinatorRole, workerRoles, buildToolDefinitions, onAgentStart, onChunk, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, onEmptyTurn = () => {}, onCoordinatorRetry = () => {}, onModelSwap = () => {}, projectContext = null, runId = trace.newRunId() }) {
   trace.logEvent(runId, 'hive_start', { task: task.slice(0, 300), maxDepth: effectiveHiveDepth(config) });
-  const dispatchTool = buildDispatchTool(workerRoles);
+  const usageTotals = { promptTokens: 0, completionTokens: 0, calls: 0 };
+  const dispatchTool = buildDispatchTool(workerRoles, recommendBatchSize(config));
   // Coordinator bekommt volle Datei-Tools (er delegiert primaer, kann aber selbst nachschauen).
   const fileTools = buildToolDefinitions(config.projectRoot);
 
@@ -270,7 +293,7 @@ async function runHive({ config, task, coordinatorRole, workerRoles, buildToolDe
     // TATSAECHLICH verwendete (evtl. per Selbstdiagnose ersetzte) Modell zeigt -- vorher zeigte
     // sie immer coordinatorRole.model, selbst wenn direkt danach ein [Modell-Wechsel] auf ein
     // anderes Modell folgte (verwirrend: Kopfzeile und Wechsel-Hinweis widersprachen sich).
-    const effectiveModel = pickEffectiveModel(coordinatorRole, onModelSwap, runId);
+    const effectiveModel = pickEffectiveModel(coordinatorRole, onModelSwap, runId, config);
     lastEffectiveModel = effectiveModel;
     onAgentStart({ ...coordinatorRole, model: effectiveModel });
 
@@ -310,7 +333,7 @@ async function runHive({ config, task, coordinatorRole, workerRoles, buildToolDe
           } catch {
             return 'FEHLER: dispatch_agents Argumente nicht parsebar.';
           }
-          const assignments = Array.isArray(args.assignments) ? args.assignments.slice(0, MAX_ASSIGNMENTS_PER_DISPATCH) : [];
+          const assignments = Array.isArray(args.assignments) ? args.assignments.slice(0, recommendBatchSize(config)) : [];
           if (!assignments.length) {
             return 'FEHLER: keine gueltigen assignments uebergeben.';
           }
@@ -321,7 +344,7 @@ async function runHive({ config, task, coordinatorRole, workerRoles, buildToolDe
             assignments.map((a) => {
               const role = workerRoles.find((r) => r.name === a.role);
               if (!role) return Promise.resolve({ role: a.role, label: a.role, error: `Rolle "${a.role}" nicht gefunden.` });
-              return runWorkerNode({ config, role, task: a.task, depth: 1, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter, onModelSwap, runId });
+              return runWorkerNode({ config, role, task: a.task, depth: 1, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter, onModelSwap, runId, usageTotals });
             })
           );
 
@@ -333,6 +356,11 @@ async function runHive({ config, task, coordinatorRole, workerRoles, buildToolDe
         maxTokens: SWARM_MAX_TOKENS,
         runId,
       });
+      if (result && result.usage) {
+        usageTotals.promptTokens += result.usage.prompt_tokens || 0;
+        usageTotals.completionTokens += result.usage.completion_tokens || 0;
+        usageTotals.calls += 1;
+      }
       // ponytail: Bug, den dieser genaue Log-Ausschnitt aufgedeckt hat -- eine leere Antwort
       // (kein Text, kein Tool-Aufruf, aber sendChat wirft KEINEN Fehler -- HTTP 200 mit leerem
       // Content) wurde bisher als "errored: false" gewertet. Ein Modell, das zuverlaessig leer
@@ -362,6 +390,7 @@ async function runHive({ config, task, coordinatorRole, workerRoles, buildToolDe
   result.dispatchHappened = dispatchHappened;
   result.runId = runId;
   result.lastModel = lastEffectiveModel;
+  result.usageTotals = usageTotals;
   trace.logEvent(runId, 'hive_done', { dispatchHappened });
   return result;
 }
@@ -382,6 +411,7 @@ function maxTotalTurns(roleCount) {
 // ueber Pfad-Sandboxing oder die Bestaetigungs-UI wissen muss.
 async function runSwarm({ config, task, roles, buildToolDefinitions, onAgentStart, onChunk, onNotice, onFileToolCall, onRetry, onEmptyTurn = () => {}, onModelSwap = () => {}, projectContext = null, runId = trace.newRunId() }) {
   trace.logEvent(runId, 'swarm_start', { task: task.slice(0, 300), roles: roles.map((r) => r.name) });
+  const usageTotals = { promptTokens: 0, completionTokens: 0, calls: 0 };
   const transcript = [{ role: 'user', content: `Team-Aufgabe: ${task}` }];
   const mailbox = {};
   const turnQueue = [...roles];
@@ -393,7 +423,7 @@ async function runSwarm({ config, task, roles, buildToolDefinitions, onAgentStar
     turnsRun++;
     // pickEffectiveModel VOR onAgentStart, damit die Anzeige das TATSAECHLICH verwendete
     // (evtl. per Selbstdiagnose ersetzte) Modell zeigt statt immer role.model.
-    const effectiveModel = pickEffectiveModel(role, onModelSwap, runId);
+    const effectiveModel = pickEffectiveModel(role, onModelSwap, runId, config);
     onAgentStart({ ...role, model: effectiveModel });
 
     const pending = mailbox[role.name] || [];
@@ -451,6 +481,11 @@ async function runSwarm({ config, task, roles, buildToolDefinitions, onAgentStar
         maxTokens: SWARM_MAX_TOKENS,
         runId,
       });
+      if (chatResult && chatResult.usage) {
+        usageTotals.promptTokens += chatResult.usage.prompt_tokens || 0;
+        usageTotals.completionTokens += chatResult.usage.completion_tokens || 0;
+        usageTotals.calls += 1;
+      }
       // Leere Antwort (kein Text, kein Tool-Aufruf, aber kein geworfener Fehler) zaehlt jetzt
       // als Fehler fuer die Selbstdiagnose -- sonst wird ein Modell, das zuverlaessig leer
       // statt mit echtem Fehler antwortet, nie als unhealthy erkannt.
@@ -490,6 +525,7 @@ async function runSwarm({ config, task, roles, buildToolDefinitions, onAgentStar
 
   trace.logEvent(runId, 'swarm_done', { turnsRun });
   transcript.runId = runId; // Arrays sind Objekte -- zusaetzliches Feld stoert Index/length/Iteration nicht.
+  transcript.usageTotals = usageTotals;
   return transcript;
 }
 
@@ -538,4 +574,4 @@ async function runConsensusCheck({ config, task, files, buildToolDefinitions, on
   return { approved: approvals >= 2, votes };
 }
 
-module.exports = { runSwarm, runHive, runConsensusCheck, SEND_MESSAGE_TOOL, recommendHiveDepth, effectiveHiveDepth };
+module.exports = { runSwarm, runHive, runConsensusCheck, SEND_MESSAGE_TOOL, recommendHiveDepth, effectiveHiveDepth, recommendBatchSize };

@@ -7,7 +7,7 @@ const path = require('path');
 const { PROVIDERS, MODEL_PRESETS, loadConfig, saveConfig, sendChat, resolveTarget, CONFIG_PATH } = require('./providers');
 const { isExhausted: isKeyExhausted } = require('./keyPool');
 const { listHealth, resetHealth } = require('./modelHealth');
-const { buildToolDefinitions: buildFileTools, WRITE_TOOLS, executeTool, undoLastWrite } = require('./tools');
+const { buildToolDefinitions: buildFileTools, WRITE_TOOLS, executeTool, undoLastWrite, previewDiff } = require('./tools');
 const { buildShellToolDefinitions, runCommand, readBackgroundOutput, checkDangerous, SHELL_WRITE_TOOLS, resetCwd } = require('./shell');
 const { AGENTS_DIR, loadAgentRoles, loadPipelineOrder } = require('./agents');
 const { runSwarm, runHive, runConsensusCheck, recommendHiveDepth, effectiveHiveDepth } = require('./swarm');
@@ -223,6 +223,17 @@ function addUsage(usage) {
   sessionUsage.calls += 1;
 }
 
+// Auf Nutzerwunsch: /usage zaehlte bisher NUR Einzel-Chat, Swarm/Hive/Agent-Zuege fehlten
+// komplett (dokumentierte Luecke, siehe README). runSwarm/runHive summieren ihre eigenen
+// Zuege bereits in einem usageTotals-Objekt (swarm.js) -- hier nur noch einmal draufaddieren,
+// statt jeden einzelnen verschachtelten Zug separat durchzureichen.
+function addUsageTotals(totals) {
+  if (!totals || !totals.calls) return;
+  sessionUsage.promptTokens += totals.promptTokens;
+  sessionUsage.completionTokens += totals.completionTokens;
+  sessionUsage.calls += totals.calls;
+}
+
 // Scope-Warnung: reine Beobachtung, kein Blocker -- viele veraenderte Dateien in einer
 // Sitzung sind oft ein Zeichen, dass die Aufgabe aus dem Ruder laeuft (nach demselben Muster
 // wie die GateGuard-Hooks in diesem Repo selbst).
@@ -264,8 +275,8 @@ const COMMAND_HELP = {
   todo: { short: 'Einfache Aufgabenliste', long: '/todo add <text> | /todo done <id> | /todo (Liste anzeigen). Datei-backed, kein Kalender/Erinnerungen.' },
   history: { short: 'Archivierte Sitzungen durchsuchen', long: '/history search <begriff> -- durchsucht alle per /new archivierten Sitzungen (sessions/*.json).' },
   codemap: { short: 'Grober Ordner-/Dateityp-Ueberblick des Projekt-Ordners', long: 'Kein AST/Deep-Scan -- nur Top-Level-Listing + Datei-Endungs-Histogramm.' },
-  undo: { short: 'Letzten write_file/edit_file fuer einen Pfad rueckgaengig machen', long: 'Nur EIN Undo-Schritt pro Datei (kein voller Verlauf).' },
-  usage: { short: 'Token-Nutzung dieser Sitzung anzeigen', long: 'Nur Einzel-Chat wird gezaehlt (Swarm/Hive-Rollen nicht), und nur wenn der Provider usage-Daten liefert.' },
+  undo: { short: 'Letzten write_file/edit_file fuer einen Pfad rueckgaengig machen', long: 'Bis zu 5 Undo-Schritte pro Datei (Ring-Puffer, kein voller Verlauf).' },
+  usage: { short: 'Token-Nutzung dieser Sitzung anzeigen', long: 'Zaehlt Einzel-Chat, /agent, /swarm und /hive (inkl. verschachtelter Worker), nur wenn der Provider usage-Daten liefert.' },
   mcp: { short: 'MCP-Server verbinden/trennen/auflisten', long: '/mcp connect <name> <kommando> [args...] | /mcp list | /mcp disconnect <name>. Nur stdio-Transport.' },
   help: { short: 'Diese Hilfe -- /help <befehl> fuer Details', long: 'Ohne Argument: alle Befehle mit Kurzbeschreibung. Mit Argument: ausfuehrlicher Text zu genau diesem Befehl.' },
   settings: { short: 'Aktuelle Konfiguration anzeigen (Keys maskiert)', long: '' },
@@ -372,8 +383,19 @@ function printBanner() {
   console.log('');
 }
 
+// Auf Nutzerwunsch: kurzer Ueberblick (Modell/Effort/Key-Anzahl) VOR jeder Eingabezeile, statt
+// dass der Nutzer dafuer erst /settings tippen muss. ponytail: bewusst reprinted statt einer
+// echten "live gepinnten" Statuszeile -- letzteres braucht ANSI-Cursor-Region-Redraw, das je
+// nach Terminal (Windows Terminal/cmd/VS Code) unterschiedlich zuverlaessig ist. Ein einfacher
+// Reprint vor jedem Prompt erreicht denselben Informationsgewinn ohne dieses Risiko.
+function statusLine() {
+  const providerLabel = PROVIDERS[config.activeProvider]?.label || config.activeProvider;
+  const keyCount = Object.values(config.keys || {}).reduce((sum, list) => sum + (Array.isArray(list) ? list.filter((k) => k && k.trim()).length : 0), 0);
+  return `${ANSI.dim}[${config.activeModel} @ ${providerLabel} | Effort ${config.effort} | ${keyCount} Key(s)]${ANSI.reset}`;
+}
+
 function printPrompt() {
-  process.stdout.write(`${ANSI.bold}> ${ANSI.reset}`);
+  process.stdout.write(`${statusLine()}\n${ANSI.bold}> ${ANSI.reset}`);
 }
 
 // Sichtbares Lebenszeichen waehrend Wartezeiten (Modell-Antwort, run_command) -- vorher war
@@ -844,6 +866,7 @@ async function handleCommand(line) {
         onEmptyTurn: (r, detail) => { stopWaiting(true); printEmptyTurn(r, detail); },
         onModelSwap: printModelSwap,
       });
+      addUsageTotals(transcript.usageTotals);
       console.log(`\n${ANSI.dim}Fertig.${ANSI.reset}\n`);
       const newFiles = [...touchedFiles].filter((f) => !beforeFiles.has(f));
       const lastMsg = transcript[transcript.length - 1];
@@ -889,7 +912,7 @@ async function handleCommand(line) {
   if (cmd === 'usage') {
     console.log(
       `${ANSI.dim}Token-Nutzung diese Sitzung: ${sessionUsage.promptTokens} prompt + ${sessionUsage.completionTokens} completion ` +
-        `(${sessionUsage.calls} Antworten mit Nutzungsdaten). Nur Einzel-Chat wird gezaehlt, Swarm/Hive-Rollen nicht.${ANSI.reset}\n`
+        `(${sessionUsage.calls} Antworten mit Nutzungsdaten). Zaehlt Einzel-Chat, /agent, /swarm, /hive.${ANSI.reset}\n`
     );
     return;
   }
@@ -1194,6 +1217,17 @@ async function runLoopCommand(kind, n, task) {
 // opts.buildToolDefinitions/opts.onFileToolCall: Ueberschreibbar fuer den Loop-Modus (fuegt
 // dort das mark_task_complete-Tool hinzu) -- normale Einzel-Laeufe nutzen unveraendert die
 // Standardwerte, kein Verhaltensunterschied ausserhalb von /swarm loop.
+// Auf Nutzerwunsch: VOR dem Start zeigen, welche Rollen-Modelle bereits als unzuverlaessig
+// markiert sind, statt es den Nutzer erst mitten im Lauf per [Modell-Wechsel]-Zeile entdecken
+// zu lassen. Rein informativ -- pickEffectiveModel weicht ohnehin automatisch aus, hier geht
+// es nur um Sichtbarkeit VORHER, keine zusaetzliche Bestaetigungsfrage noetig.
+function preflightHealthWarning(modelKeys) {
+  const unique = [...new Set(modelKeys)];
+  const unhealthy = listHealth(unique).filter((h) => h.unhealthy);
+  if (!unhealthy.length) return null;
+  return unhealthy.map((h) => `  - ${h.key}: ${h.reason}`).join('\n');
+}
+
 async function runSwarmCommand(task, opts = {}) {
   const buildTools = opts.buildToolDefinitions || buildToolDefinitions;
   const fileToolCall = opts.onFileToolCall || ((toolCall) => handleToolCall(toolCall, { swarmMode: true }));
@@ -1207,6 +1241,10 @@ async function runSwarmCommand(task, opts = {}) {
   if (!orderedRoles.length) {
     console.log(`${ANSI.error}Pipeline-Reihenfolge (agents/pipeline.json) passt zu keiner vorhandenen Rolle.${ANSI.reset}\n`);
     return;
+  }
+  const swarmPreflight = preflightHealthWarning(orderedRoles.map((r) => r.model));
+  if (swarmPreflight) {
+    console.log(`${ANSI.error}[Vorab-Check] Aktuell unzuverlaessig markiert (wird automatisch ersetzt):\n${swarmPreflight}${ANSI.reset}`);
   }
   console.log(`${ANSI.dim}Swarm startet (autonom, keine Bestaetigungsfragen -- /swarmautonomy off zum Abschalten): ${orderedRoles.map((r) => r.label).join(' -> ')}${ANSI.reset}`);
   let retryCount = 0;
@@ -1241,6 +1279,7 @@ async function runSwarmCommand(task, opts = {}) {
       onEmptyTurn: (role, detail) => { emptyTurnCount++; stopWaiting(true); printEmptyTurn(role, detail); },
       onModelSwap: printModelSwap,
     });
+    addUsageTotals(transcript.usageTotals);
     console.log(`\n${ANSI.dim}Swarm fertig. (${turnCount} Zuege, ${retryCount} Retries, ${emptyTurnCount} leere Zuege) -- Trace-ID: ${transcript.runId} (Details: /trace ${transcript.runId})${ANSI.reset}\n`);
     const newFiles = [...touchedFiles].filter((f) => !beforeFiles.has(f));
     const lastMsg = transcript[transcript.length - 1];
@@ -1269,6 +1308,10 @@ async function runHiveCommand(task, opts = {}) {
   if (!workerRoles.length) {
     console.log(`${ANSI.error}Keine Worker-Rollen gefunden (ausser Coordinator).${ANSI.reset}\n`);
     return;
+  }
+  const hivePreflight = preflightHealthWarning([coordinatorRole.model, ...workerRoles.map((r) => r.model)]);
+  if (hivePreflight) {
+    console.log(`${ANSI.error}[Vorab-Check] Aktuell unzuverlaessig markiert (wird automatisch ersetzt):\n${hivePreflight}${ANSI.reset}`);
   }
   console.log(
     `${ANSI.dim}Hive startet (autonom, keine Bestaetigungsfragen -- /swarmautonomy off zum Abschalten): ${coordinatorRole.label} verteilt an bis zu ${workerRoles.length} Worker (${workerRoles.map((r) => r.name).join(', ')})${ANSI.reset}`
@@ -1334,6 +1377,7 @@ async function runHiveCommand(task, opts = {}) {
     // statt einen tickenden Heartbeat nach Lauf-Ende weiterlaufen zu lassen.
     for (const stop of workerWaiters.values()) stop(false);
     workerWaiters.clear();
+    addUsageTotals(result.usageTotals);
     if (!result.dispatchHappened) {
       console.log(
         `\n${ANSI.error}[Fehlschlag] Coordinator hat trotz ${coordinatorRetries + 1} Versuch(en) keinen einzigen Worker gestartet (zuletzt versucht mit "${result.lastModel || coordinatorRole.model}" -- haeufige Ursache: wiederholte Server-Ueberlastung oder leere Antworten). Aufgabe erneut per /hive versuchen oder /model fuer die Coordinator-Rolle wechseln.${ANSI.reset}\n`
@@ -1622,6 +1666,20 @@ function askConfirmation(promptText) {
   return askQuestion(promptText).then((answer) => /^(y|yes|j|ja)$/i.test(answer));
 }
 
+// Auf Nutzerwunsch: "Allow once/Always/Reject" statt reinem y/N -- "Always" spart die
+// wiederholte Nachfrage fuer dasselbe Tool (setzt /permission <tool> allow direkt). ponytail:
+// bewusst NUMMERIERTE Textauswahl statt echtem Pfeiltasten-Menu -- ein echtes Menu braucht
+// TTY-Raw-Mode-Keypress-Events, die mit der bestehenden Frage-Queue (siehe questionQueue oben,
+// gebaut fuer GLEICHZEITIGE Bestaetigungsfragen von parallelen Hive-Workern) kollidieren
+// wuerden. Gleicher Funktionsgewinn (3 Optionen statt 2), ohne dieses Risiko.
+async function askToolConfirmation(promptText) {
+  const answer = (await askQuestion(`${promptText}\n  [1] Einmal erlauben  [2] Immer erlauben  [3] Ablehnen (Enter=1): `)).trim();
+  if (answer === '2') return 'always';
+  if (answer === '3' || /^(n|no|nein)$/i.test(answer)) return 'reject';
+  if (!answer || answer === '1' || /^(y|yes|j|ja)$/i.test(answer)) return 'once';
+  return 'reject'; // unbekannte Eingabe -- im Zweifel ablehnen, nicht erlauben
+}
+
 // Reads/Listings laufen ohne Nachfrage (nicht destruktiv). write_file/make_directory/
 // run_command/MCP-Tools verlangen erst eine explizite Bestaetigung -- das Modell kommt von
 // einem Drittanbieter-Endpunkt ohne die gleichen Garantien wie Claude, deshalb kein
@@ -1675,8 +1733,16 @@ async function handleToolCall(toolCall, ctx = {}) {
   }
 
   if (needsConfirmationBase && permission !== 'allow' && !config.autoApprove && !swarmAutonomyActive) {
-    const ok = await askConfirmation(`${ANSI.bold}Erlauben -- ${formatToolCallForDisplay(name, args)}? (y/N) ${ANSI.reset}`);
-    if (!ok) {
+    if (name === 'write_file' || name === 'edit_file') {
+      const diff = previewDiff(config.projectRoot, name, args);
+      if (diff) console.log(`${ANSI.dim}${diff}${ANSI.reset}`);
+    }
+    const decision = await askToolConfirmation(`${ANSI.bold}Erlauben -- ${formatToolCallForDisplay(name, args)}?${ANSI.reset}`);
+    if (decision === 'always') {
+      config.toolPermissions[name] = 'allow';
+      saveConfig(config);
+      console.log(`${ANSI.dim}"${name}" dauerhaft erlaubt (siehe /permission).${ANSI.reset}`);
+    } else if (decision === 'reject') {
       console.log(`${ANSI.dim}Abgelehnt.${ANSI.reset}`);
       appendAuditLog(AUDIT_LOG_PATH, { name, args, outcome: 'denied-by-user' });
       return 'ABGELEHNT: Der Nutzer hat diesen Vorgang nicht erlaubt.';
