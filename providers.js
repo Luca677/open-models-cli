@@ -43,6 +43,13 @@ const MODEL_PRESETS = {
   'gpt-oss-120b': { label: 'OpenAI gpt-oss-120b', provider: 'openrouter', model: 'openai/gpt-oss-120b:free' },
   'gpt-oss-20b': { label: 'OpenAI gpt-oss-20b (schnell)', provider: 'openrouter', model: 'openai/gpt-oss-20b:free' },
   'gemma': { label: 'Google Gemma 4 31B', provider: 'openrouter', model: 'google/gemma-4-31b-it:free' },
+  // Persoenlich/maschinenspezifisch (anders als die Presets oben, die fuer JEDEN Nutzer dieses
+  // Tools gleich funktionieren) -- zeigt auf ein lokales Ollama-Modell, das per /ollamahost auf
+  // einem beliebigen Rechner im Netzwerk erreichbar gemacht wird (siehe README). Als Preset
+  // (statt nur rohe Modell-ID) angelegt, damit Rollen es einfach ueber role.model referenzieren
+  // koennen, OHNE vom aktuellen globalen /provider abzuhaengen (swarm.js ueberschreibt bei
+  // Rollen nur activeModel, nicht activeProvider -- eine rohe ID ohne Preset waere fragil).
+  'ollama-laptop': { label: 'Qwen 2.5 Coder 14B (lokal, Laptop im Netzwerk)', provider: 'ollama', model: 'qwen2.5-coder:14b' },
 };
 
 const DEFAULT_CONFIG = {
