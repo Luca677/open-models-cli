@@ -75,6 +75,40 @@ function mistakesSystemMessage(mistakeLog) {
   };
 }
 
+// Gegenstueck zum mistakeLog (auf Nutzerwunsch, "was gut lief auch festhalten, nicht nur
+// Fehler"): pro Rolle wird nur der ERSTE saubere (nicht-leere, fehlerfreie) Zug in diesem Lauf
+// festgehalten -- ein repraesentatives Beispiel, kein Spam bei jedem einzelnen Erfolg. Wird
+// NICHT live in nachfolgende Zuege injiziert (anders als mistakeLog) -- der Wert liegt im
+// CROSS-Lauf-Lernen ueber AGENTS_MEMORY.md (siehe index.js formatSuccesses), nicht im
+// unmittelbaren Gegendruck innerhalb eines Laufs.
+const SUCCESS_LOG_CAP = 10;
+
+function pushSuccess(successLog, who, what) {
+  if (successLog.some((s) => s.who === who)) return; // nur der erste saubere Zug pro Rolle
+  const trimmed = what.length > 150 ? `${what.slice(0, 150)}...` : what;
+  successLog.push({ who, what: trimmed });
+  if (successLog.length > SUCCESS_LOG_CAP) successLog.shift();
+}
+
+// Auf Nutzerwunsch ("sollen nochmal mehr nachdenken ... Gedankenspirale nach oben statt
+// unten"): Entwurf-Selbstpruefung-Antwort als EIN Prompt-Aufbau statt eines zweiten,
+// kostenpflichtigen API-Aufrufs. Die KONFIDENZ-Zeile ist zusaetzlich maschinell auswertbar:
+// eine als "niedrig" selbst eingeschaetzte Antwort wird unten wie ein leerer Zug ins
+// mistakeLog aufgenommen -- macht Selbstzweifel fuer nachfolgende Zuege sichtbar, ohne dass
+// der Coordinator jede Antwort selbst inhaltlich bewerten muesste.
+const SPIRAL_SYSTEM_MESSAGE = {
+  role: 'system',
+  content:
+    'Denkweise fuer diesen Zug: formuliere zuerst STILL einen Loesungsansatz, pruefe ihn dann ' +
+    'kurz selbst auf Fehler, Luecken oder Widersprueche zu bisherigen Zuegen -- korrigiere, ' +
+    'falls noetig -- und gib erst DANACH deine finale Antwort/Tool-Nutzung. Beende jede ' +
+    'inhaltliche Antwort (nicht bei reinen Tool-Aufrufen) mit einer eigenen Zeile ' +
+    '"KONFIDENZ: hoch" / "KONFIDENZ: mittel" / "KONFIDENZ: niedrig" -- ehrlich einschaetzen, ' +
+    'nicht automatisch "hoch" waehlen.',
+};
+
+const LOW_CONFIDENCE_PATTERN = /KONFIDENZ:\s*niedrig/i;
+
 // Macht eine leere Antwort (weder Text noch Tool-Aufruf) diagnostizierbar statt nur "moeglicher
 // Modell-Aussetzer" zu raten: finish_reason:"length" + reasoningChars>0 heisst konkret "Budget
 // ging fuers Denken drauf, bevor sichtbarer Output kam" (siehe SWARM_MAX_TOKENS-Kommentar oben).
@@ -189,7 +223,7 @@ function recommendBatchSize(config) {
 // Baum geteiltes { n } Objekt (per Referenz durchgereicht) -- liefert eindeutige Worker-IDs
 // (nicht nur pro Rollenname, siehe Kommentar bei workerSeq weiter unten) auch ueber mehrere
 // Verschachtelungsebenen hinweg.
-async function runWorkerNode({ config, role, task, depth, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter, onModelSwap = () => {}, runId = null, usageTotals = { promptTokens: 0, completionTokens: 0, calls: 0 }, mistakeLog = [] }) {
+async function runWorkerNode({ config, role, task, depth, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter, onModelSwap = () => {}, runId = null, usageTotals = { promptTokens: 0, completionTokens: 0, calls: 0 }, mistakeLog = [], successLog = [] }) {
   const workerId = `${role.name}#${counter.n++}`;
   // pickEffectiveModel VOR onWorkerStart, damit die Anzeige das TATSAECHLICH verwendete
   // (evtl. per Selbstdiagnose ersetzte) Modell zeigt statt immer role.model.
@@ -214,6 +248,7 @@ async function runWorkerNode({ config, role, task, depth, workerRoles, buildTool
       messages: [
         { role: 'system', content: role.systemPrompt },
         fableSystemMessage(),
+        SPIRAL_SYSTEM_MESSAGE,
         ...(projectContext ? [{ role: 'system', content: projectContext }] : []),
         ...(mistakesMsg ? [mistakesMsg] : []),
         { role: 'user', content: task },
@@ -237,7 +272,7 @@ async function runWorkerNode({ config, role, task, depth, workerRoles, buildTool
             assignments.map((a) => {
               const subRole = workerRoles.find((r) => r.name === a.role);
               if (!subRole) return Promise.resolve({ role: a.role, label: a.role, error: `Rolle "${a.role}" nicht gefunden.` });
-              return runWorkerNode({ config, role: subRole, task: a.task, depth: depth + 1, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter, onModelSwap, runId, usageTotals, mistakeLog });
+              return runWorkerNode({ config, role: subRole, task: a.task, depth: depth + 1, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter, onModelSwap, runId, usageTotals, mistakeLog, successLog });
             })
           );
           return subOutcomes
@@ -274,6 +309,11 @@ async function runWorkerNode({ config, role, task, depth, workerRoles, buildTool
       return { role: role.name, label: role.label, error: warning };
     }
     trace.logEvent(runId, 'worker_done', { workerId, role: role.name, model: effectiveModel, durationMs: Date.now() - startMs });
+    if (LOW_CONFIDENCE_PATTERN.test(text)) {
+      pushMistake(mistakeLog, `${role.label} (${effectiveModel})`, `eigene Konfidenz niedrig eingeschaetzt: ${text.slice(-150)}`);
+    } else {
+      pushSuccess(successLog, role.label, text);
+    }
     onWorkerDone(role, text, null, workerId);
     return { role: role.name, label: role.label, text };
   } catch (err) {
@@ -305,6 +345,7 @@ async function runHive({ config, task, coordinatorRole, workerRoles, buildToolDe
   trace.logEvent(runId, 'hive_start', { task: task.slice(0, 300), maxDepth: effectiveHiveDepth(config) });
   const usageTotals = { promptTokens: 0, completionTokens: 0, calls: 0 };
   const mistakeLog = [];
+  const successLog = [];
   const dispatchTool = buildDispatchTool(workerRoles, recommendBatchSize(config));
   // Coordinator bekommt volle Datei-Tools (er delegiert primaer, kann aber selbst nachschauen).
   const fileTools = buildToolDefinitions(config.projectRoot);
@@ -337,6 +378,7 @@ async function runHive({ config, task, coordinatorRole, workerRoles, buildToolDe
     const coordinatorMessages = [
       { role: 'system', content: coordinatorRole.systemPrompt },
       fableSystemMessage(),
+      SPIRAL_SYSTEM_MESSAGE,
       ...(projectContext ? [{ role: 'system', content: projectContext }] : []),
       ...(mistakesMsg ? [mistakesMsg] : []),
       { role: 'user', content: `Team-Aufgabe: ${task}` },
@@ -381,7 +423,7 @@ async function runHive({ config, task, coordinatorRole, workerRoles, buildToolDe
             assignments.map((a) => {
               const role = workerRoles.find((r) => r.name === a.role);
               if (!role) return Promise.resolve({ role: a.role, label: a.role, error: `Rolle "${a.role}" nicht gefunden.` });
-              return runWorkerNode({ config, role, task: a.task, depth: 1, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter, onModelSwap, runId, usageTotals, mistakeLog });
+              return runWorkerNode({ config, role, task: a.task, depth: 1, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter, onModelSwap, runId, usageTotals, mistakeLog, successLog });
             })
           );
 
@@ -417,6 +459,10 @@ async function runHive({ config, task, coordinatorRole, workerRoles, buildToolDe
       if (isEmpty) {
         pushMistake(mistakeLog, `Coordinator (${effectiveModel})`, `LEER: ${describeEmptyTurn(result) || 'keine Antwort'}`);
         onEmptyTurn(coordinatorRole, describeEmptyTurn(result));
+      } else if (LOW_CONFIDENCE_PATTERN.test(result.finalText)) {
+        pushMistake(mistakeLog, `Coordinator (${effectiveModel})`, `eigene Konfidenz niedrig eingeschaetzt: ${result.finalText.slice(-150)}`);
+      } else {
+        pushSuccess(successLog, 'Coordinator', result.finalText);
       }
     } catch (err) {
       // Nicht die ganze Hive abbrechen -- als leerer Zug behandeln (loest im naechsten
@@ -433,6 +479,7 @@ async function runHive({ config, task, coordinatorRole, workerRoles, buildToolDe
   result.lastModel = lastEffectiveModel;
   result.usageTotals = usageTotals;
   result.mistakeLog = mistakeLog;
+  result.successLog = successLog;
   trace.logEvent(runId, 'hive_done', { dispatchHappened });
   return result;
 }
@@ -455,6 +502,7 @@ async function runSwarm({ config, task, roles, buildToolDefinitions, onAgentStar
   trace.logEvent(runId, 'swarm_start', { task: task.slice(0, 300), roles: roles.map((r) => r.name) });
   const usageTotals = { promptTokens: 0, completionTokens: 0, calls: 0 };
   const mistakeLog = [];
+  const successLog = [];
   const transcript = [{ role: 'user', content: `Team-Aufgabe: ${task}` }];
   const mailbox = {};
   const turnQueue = [...roles];
@@ -477,6 +525,7 @@ async function runSwarm({ config, task, roles, buildToolDefinitions, onAgentStar
     const roleMessages = [
       { role: 'system', content: role.systemPrompt },
       fableSystemMessage(),
+      SPIRAL_SYSTEM_MESSAGE,
       ...(projectContext ? [{ role: 'system', content: projectContext }] : []),
       ...(styleMsg ? [styleMsg] : []),
       ...(mistakesMsg ? [mistakesMsg] : []),
@@ -543,6 +592,13 @@ async function runSwarm({ config, task, roles, buildToolDefinitions, onAgentStar
         errorMessage: isEmptyTurn ? 'leere Antwort (kein Text, kein Tool-Aufruf)' : '',
       });
       trace.logEvent(runId, 'turn_done', { role: role.name, model: effectiveModel, durationMs: Date.now() - startMs });
+      if (!isEmptyTurn) {
+        if (LOW_CONFIDENCE_PATTERN.test(finalText)) {
+          pushMistake(mistakeLog, `${role.label} (${effectiveModel})`, `eigene Konfidenz niedrig eingeschaetzt: ${finalText.slice(-150)}`);
+        } else {
+          pushSuccess(successLog, role.label, finalText);
+        }
+      }
     } catch (err) {
       // Nicht den ganzen Schwarm abbrechen -- als leerer Zug behandeln, Diagnose merkt sich
       // den Fehlschlag (fuehrt bei Wiederholung zum automatischen Modell-Wechsel).
@@ -576,6 +632,7 @@ async function runSwarm({ config, task, roles, buildToolDefinitions, onAgentStar
   transcript.runId = runId; // Arrays sind Objekte -- zusaetzliches Feld stoert Index/length/Iteration nicht.
   transcript.usageTotals = usageTotals;
   transcript.mistakeLog = mistakeLog;
+  transcript.successLog = successLog;
   return transcript;
 }
 

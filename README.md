@@ -151,6 +151,42 @@ probiert. Zustand liegt in `key-health.json` (Key nur als Hash, nie im Klartext)
 gleichzeitig laufende CLI-Instanzen sich denselben Key-Pool teilen, ohne sich gegenseitig zu
 ueberschreiben.
 
+## Positiv-Gedaechtnis, Denkspirale, Loop-Fortschritt, Domain-Vorfilter (6. Runde)
+
+Vier neue Prinzipien, auf Nutzerwunsch nach "neuen Prinzipien und Ideen" fuer weniger
+wiederholte Fehler und mehr Ausrichtung zwischen Rollen -- alle ohne zusaetzliche
+kostenpflichtige API-Aufrufe:
+
+**Positiv-Gedaechtnis (swarm.js `successLog`):** Gegenstueck zum `mistakeLog` aus der 5.
+Runde -- pro Rolle wird der ERSTE saubere Zug in einem Lauf festgehalten (nicht jeder
+einzelne, das waere Spam) und landet als **Erfolgsmuster:**-Block in `AGENTS_MEMORY.md`.
+Kuenftige Laeufe sehen so auch, was funktioniert hat, nicht nur was schiefging.
+
+**Denkspirale + Konfidenz-Tag (swarm.js `SPIRAL_SYSTEM_MESSAGE`):** jede Rolle bekommt jetzt
+die Anweisung, ERST still einen Entwurf zu formulieren, sich selbst auf Fehler/Widersprueche
+zu pruefen, und DANN erst zu antworten -- alles in EINEM Prompt-Aufbau, kein zweiter Modell-
+Aufruf. Jede inhaltliche Antwort endet mit "KONFIDENZ: hoch/mittel/niedrig". Eine
+selbsteingeschaetzte "niedrig"-Antwort wird automatisch wie ein leerer Zug ins `mistakeLog`
+aufgenommen -- macht Selbstzweifel fuer nachfolgende Zuege sichtbar, ohne dass irgendjemand
+den Inhalt manuell bewerten muss.
+
+**Loop-Fortschritt explizit (index.js `runLoopCommand`):** `/hive loop`/`/swarm loop` sahen
+bisher nur implizit ueber die Speichersuche etwas Relevantes. Ab Durchlauf 2 wird der letzte
+`AGENTS_MEMORY.md`-Eintrag (per `searchProjectMemory(root, '', 1)`) explizit als "Durchlauf N
+von M, letzter Durchlauf: ..." in den Prompt eingeblendet -- klarer Konvergenz-Status statt
+Rohdaten-Raten.
+
+**Domain-Vorfilter (index.js `suggestRelevantRoles`):** reine Keyword-Heuristik (wie
+`/recommend` fuers Modell) schlaegt dem Coordinator bei `/hive` VOR dem Dispatch besonders
+relevante Rollen fuer die konkrete Aufgabe vor (z.B. Security-Keywords -> `ecc-security`
+vorschlagen) -- ein sanfter Hinweis im Prompt, keine harte Einschraenkung, der Coordinator
+kann trotzdem jede Rolle waehlen.
+
+Alle vier Zusaetze nutzen dieselbe Trennung "Prompt-Text vs. geloggter Task-Text"
+(`opts.promptPrefix` in `runSwarmCommand`/`runHiveCommand`) -- der Domain-Hinweis und die
+Loop-Fortschrittsnotiz landen NUR im Modell-Prompt, nicht in der Speichersuche-Anfrage oder
+im `AGENTS_MEMORY.md`-Aufgabenfeld, damit die dort nicht mit Zusatztext zuwachsen.
+
 ## Geteiltes Fehler-Gedaechtnis, staerkerer Austausch zwischen Rollen (5. Runde)
 
 Auf Nutzerwunsch: "Modelle machen haeufig dieselben Fehler, sprechen sich wenig ab, sollten

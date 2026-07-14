@@ -272,6 +272,14 @@ function formatLessons(mistakeLog) {
   return lessons.slice(-10);
 }
 
+// Gegenstueck zu formatLessons -- swarm.js' successLog (ein sauberer Zug pro Rolle) wird
+// genauso in AGENTS_MEMORY.md gespeichert, damit kuenftige Laeufe auch sehen, was FUNKTIONIERT
+// hat, nicht nur was schiefging.
+function formatSuccesses(successLog) {
+  if (!successLog || !successLog.length) return undefined;
+  return successLog.map((s) => `${s.who}: ${s.what}`).slice(-10);
+}
+
 // Scope-Warnung: reine Beobachtung, kein Blocker -- viele veraenderte Dateien in einer
 // Sitzung sind oft ein Zeichen, dass die Aufgabe aus dem Ruder laeuft (nach demselben Muster
 // wie die GateGuard-Hooks in diesem Repo selbst).
@@ -913,6 +921,7 @@ async function handleCommand(line) {
         files: newFiles,
         summary: lastMsg ? shorten(lastMsg.content, 500) : '(keine Textzusammenfassung)',
         lessons: formatLessons(transcript.mistakeLog),
+        successes: formatSuccesses(transcript.successLog),
       });
     } catch (err) {
       stopWaiting(true);
@@ -1231,10 +1240,26 @@ async function runLoopCommand(kind, n, task) {
         return handleToolCall(toolCall, { swarmMode: true });
       };
 
+      // Auf Nutzerwunsch ("Loop-Fortschritt explizit"): ab Durchlauf 2 den letzten
+      // AGENTS_MEMORY.md-Eintrag (von genau diesem Loop geschrieben, siehe appendProjectMemory
+      // unten in runHiveCommand/runSwarmCommand) als expliziten Fortschritts-/Konvergenz-
+      // Hinweis in den Prompt einblenden -- statt dass der naechste Durchlauf nur implizit
+      // ueber die Speichersuche etwas Relevantes findet, sieht er explizit "das war der letzte
+      // Durchlauf, das noch offen ist". searchProjectMemory(root, '', 1) liefert den neuesten
+      // Eintrag (leere Anfrage -> Fallback auf die letzten N Eintraege, siehe memory.js).
+      const promptPrefix = i > 1
+        ? (() => {
+            const lastEntry = searchProjectMemory(config.projectRoot, '', 1);
+            return lastEntry
+              ? `[Loop-Fortschritt: Durchlauf ${i}${unbounded ? '' : `/${n}`} dieser Mehrfach-Durchlauf-Aufgabe. Letzter Durchlauf:\n${shorten(lastEntry, 600)}]\n\n`
+              : '';
+          })()
+        : '';
+
       if (kind === 'hive') {
-        await runHiveCommand(task, { buildToolDefinitions: loopBuildTools, onFileToolCall: loopFileToolCall });
+        await runHiveCommand(task, { buildToolDefinitions: loopBuildTools, onFileToolCall: loopFileToolCall, promptPrefix });
       } else {
-        await runSwarmCommand(task, { buildToolDefinitions: loopBuildTools, onFileToolCall: loopFileToolCall });
+        await runSwarmCommand(task, { buildToolDefinitions: loopBuildTools, onFileToolCall: loopFileToolCall, promptPrefix });
       }
 
       if (stopped) {
@@ -1267,9 +1292,37 @@ function preflightHealthWarning(modelKeys) {
   return unhealthy.map((h) => `  - ${h.key}: ${h.reason}`).join('\n');
 }
 
+// Auf Nutzerwunsch ("Domain-Vorfilter"): der Coordinator kennt bis zu 8 Worker-Rollen und
+// dispatcht bei vagen Aufgaben manchmal blind an alle statt gezielt an die passenden --
+// reine Keyword-Heuristik (wie /recommend fuer Modelle), kein gelerntes Routing, nur ein
+// SANFTER Hinweis im Prompt -- der Coordinator kann weiterhin jede verfuegbare Rolle waehlen.
+const ROLE_DOMAIN_KEYWORDS = {
+  coder: ['code', 'bug', 'feature', 'implementier', 'programm', 'app ', 'spiel', 'game', 'baue', 'erstelle', 'schreib'],
+  'ecc-security': ['security', 'sicherheit', 'auth', 'passwort', 'verschluessel', 'vulnerab', 'exploit', 'csrf', 'xss', 'injection'],
+  'ecc-reviewer': ['review', 'pruef', 'qualitaet', 'code-review', 'refactor'],
+  'ruflo-architect': ['architektur', 'design', 'struktur', 'skalier', 'schema'],
+  'ruflo-researcher': ['recherch', 'vergleich', 'analysiere', 'untersuch', 'welche bibliothek', 'welches framework'],
+  planner: ['plan', 'konzept', 'schritt', 'roadmap'],
+  reviewer: ['review', 'test', 'pruef', 'qualitaet'],
+  explorer: ['erkunde', 'analysiere', 'verstehe', 'codebase', 'ueberblick'],
+};
+
+function suggestRelevantRoles(task, workerRoles) {
+  const lower = task.toLowerCase();
+  return workerRoles
+    .map((r) => ({ role: r, hits: (ROLE_DOMAIN_KEYWORDS[r.name] || []).filter((k) => lower.includes(k)).length }))
+    .filter((s) => s.hits > 0)
+    .sort((a, b) => b.hits - a.hits)
+    .map((s) => s.role.label);
+}
+
 async function runSwarmCommand(task, opts = {}) {
   const buildTools = opts.buildToolDefinitions || buildToolDefinitions;
   const fileToolCall = opts.onFileToolCall || ((toolCall) => handleToolCall(toolCall, { swarmMode: true }));
+  // opts.promptPrefix: nur der Modell-Prompt bekommt den Zusatz (z.B. Loop-Fortschrittsnotiz
+  // aus runLoopCommand) -- buildAgentContext-Suche und AGENTS_MEMORY.md-Eintrag nutzen weiter
+  // das unveraenderte `task`, damit die Suchanfrage/das Log nicht mit Zusatztext zuwaechst.
+  const promptTask = opts.promptPrefix ? `${opts.promptPrefix}${task}` : task;
   const roles = loadAgentRoles();
   if (!roles.length) {
     console.log(`${ANSI.error}Keine Agent-Rollen in ${AGENTS_DIR} gefunden (JSON-Dateien anlegen, siehe README).${ANSI.reset}\n`);
@@ -1295,7 +1348,7 @@ async function runSwarmCommand(task, opts = {}) {
   try {
     const transcript = await runSwarm({
       config,
-      task,
+      task: promptTask,
       roles: orderedRoles,
       buildToolDefinitions: buildTools,
       projectContext: buildAgentContext(config.projectRoot, task),
@@ -1327,6 +1380,7 @@ async function runSwarmCommand(task, opts = {}) {
       files: newFiles,
       summary: lastMsg ? shorten(lastMsg.content, 500) : '(keine Textzusammenfassung)',
       lessons: formatLessons(transcript.mistakeLog),
+      successes: formatSuccesses(transcript.successLog),
     });
   } catch (err) {
     stopWaiting(true);
@@ -1349,6 +1403,13 @@ async function runHiveCommand(task, opts = {}) {
     console.log(`${ANSI.error}Keine Worker-Rollen gefunden (ausser Coordinator).${ANSI.reset}\n`);
     return;
   }
+  const relevantRoles = suggestRelevantRoles(task, workerRoles);
+  const domainHint = relevantRoles.length
+    ? `[Hinweis: fuer diese Aufgabe wirken besonders relevant: ${relevantRoles.join(', ')} -- du kannst trotzdem jede verfuegbare Rolle einsetzen.]\n\n`
+    : '';
+  // Gleiche Trennung wie in runSwarmCommand: nur der Modell-Prompt bekommt Domain-Hinweis +
+  // ggf. Loop-Fortschrittsnotiz, buildAgentContext-Suche/AGENTS_MEMORY.md bleiben unveraendert.
+  const promptTask = `${opts.promptPrefix || ''}${domainHint}${task}`;
   const hivePreflight = preflightHealthWarning([coordinatorRole.model, ...workerRoles.map((r) => r.model)]);
   if (hivePreflight) {
     console.log(`${ANSI.error}[Vorab-Check] Aktuell unzuverlaessig markiert (wird automatisch ersetzt):\n${hivePreflight}${ANSI.reset}`);
@@ -1371,7 +1432,7 @@ async function runHiveCommand(task, opts = {}) {
   try {
     const result = await runHive({
       config,
-      task,
+      task: promptTask,
       coordinatorRole,
       workerRoles,
       buildToolDefinitions: buildTools,
@@ -1487,6 +1548,7 @@ async function runHiveCommand(task, opts = {}) {
         files: newFiles,
         summary: shorten(finalSummary, 500),
         lessons: formatLessons(result.mistakeLog),
+        successes: formatSuccesses(result.successLog),
       });
     }
   } catch (err) {
