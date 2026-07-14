@@ -151,6 +151,20 @@ probiert. Zustand liegt in `key-health.json` (Key nur als Hash, nie im Klartext)
 gleichzeitig laufende CLI-Instanzen sich denselben Key-Pool teilen, ohne sich gegenseitig zu
 ueberschreiben.
 
+## Selbstdiagnose auch im Einzel-Chat (Bugfix)
+
+Echter Bug-Report: deepseek-v4 (schon per `/modelhealth` als 50% Fehlerquote unhealthy markiert)
+explorierte im Einzel-Chat mehrere Dateien und brach dann OHNE jeden Hinweis ab -- "nichts ist
+veraendert". Ursache: die gesamte Selbstdiagnose (`diagnose`/`pickReplacement` VOR dem Zug,
+`recordAttempt` NACH dem Zug, Warnung bei leerer Antwort) existierte bisher NUR fuer
+`/swarm`/`/hive` -- der Einzel-Chat (`attemptChat`/`handleMessage` in index.js), der meist-
+genutzte Modus, hatte davon nichts. Jetzt: vor jedem Einzel-Chat-Zug wird das aktive Modell
+geprueft und bei Bedarf automatisch ersetzt (`[Modell-Wechsel]`-Hinweis), nach dem Zug fliesst
+das Ergebnis in dieselbe `model-health.json` wie bei Swarm/Hive ein, und eine leere Antwort
+zeigt jetzt `[Warnung]` mit `finish_reason`/Gedankenketten-Details statt stillschweigend nichts
+zu tun. Gilt auch fuer den `/fallback`-Pfad. Per E2E-Test (echter Kind-Prozess, simulierte
+leere SSE-Antwort) verifiziert -- reproduziert den gemeldeten Fall exakt.
+
 ## Positiv-Gedaechtnis, Denkspirale, Loop-Fortschritt, Domain-Vorfilter (6. Runde)
 
 Vier neue Prinzipien, auf Nutzerwunsch nach "neuen Prinzipien und Ideen" fuer weniger

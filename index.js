@@ -6,7 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const { PROVIDERS, MODEL_PRESETS, loadConfig, saveConfig, sendChat, resolveTarget, CONFIG_PATH } = require('./providers');
 const { isExhausted: isKeyExhausted } = require('./keyPool');
-const { listHealth, resetHealth } = require('./modelHealth');
+const { listHealth, resetHealth, diagnose, pickReplacement, recordAttempt } = require('./modelHealth');
 const { buildToolDefinitions: buildFileTools, WRITE_TOOLS, executeTool, undoLastWrite, previewDiff } = require('./tools');
 const { buildShellToolDefinitions, runCommand, readBackgroundOutput, checkDangerous, SHELL_WRITE_TOOLS, resetCwd } = require('./shell');
 const { AGENTS_DIR, loadAgentRoles, loadPipelineOrder } = require('./agents');
@@ -1595,22 +1595,45 @@ async function compactHistoryIfNeeded() {
 
 // Ein Versuch mit `activeConfig` (kann der Fallback-Config entsprechen). Wirft weiter,
 // wenn es fehlschlaegt -- handleMessage entscheidet, ob/wie ein zweiter Versuch folgt.
+// Auf Nutzerwunsch (echter Bug-Report: deepseek-v4 -- schon als 50% Fehlerquote unhealthy
+// markiert -- explorierte im Einzel-Chat mehrere Dateien und brach dann OHNE jeden Hinweis
+// ab, "nichts ist veraendert"): Einzel-Chat hatte bisher NICHTS von der Selbstdiagnose, die
+// /swarm/hive laengst haben -- kein diagnose/pickReplacement VOR dem Zug, kein recordAttempt
+// NACH dem Zug, keine Warnung bei leerer Antwort. Bringt Einzel-Chat auf denselben Stand.
+function describeEmptyChatTurn(result) {
+  const parts = [];
+  if (result.finishReason) parts.push(`finish_reason: ${result.finishReason}`);
+  if (result.reasoningChars) parts.push(`${result.reasoningChars} Zeichen interne Gedankenkette verbraucht`);
+  return parts.length ? ` (${parts.join(', ')})` : '';
+}
+
 async function attemptChat(activeConfig) {
-  const styleMsg = styleSystemMessage(activeConfig.style);
-  const effortMsg = effortSystemMessage(activeConfig.effort);
+  const diag = diagnose(activeConfig.activeModel);
+  let runConfig = activeConfig;
+  if (diag.unhealthy) {
+    const replacement = pickReplacement(activeConfig.activeModel, Object.keys(MODEL_PRESETS), activeConfig);
+    if (replacement !== activeConfig.activeModel) {
+      console.log(`${ANSI.accent}[Modell-Wechsel] "${activeConfig.activeModel}" wirkt unzuverlaessig (${diag.reason}) -- ersetzt durch "${replacement}".${ANSI.reset}`);
+      runConfig = { ...activeConfig, activeModel: replacement };
+    }
+  }
+  const styleMsg = styleSystemMessage(runConfig.style);
+  const effortMsg = effortSystemMessage(runConfig.effort);
   const lastUserMsg = [...messages].reverse().find((m) => m.role === 'user');
-  const agentContext = buildAgentContext(activeConfig.projectRoot, lastUserMsg ? lastUserMsg.content : '');
+  const agentContext = buildAgentContext(runConfig.projectRoot, lastUserMsg ? lastUserMsg.content : '');
   const projectMsg = agentContext ? { role: 'system', content: agentContext } : null;
   const extraMessages = [fableSystemMessage(), styleMsg, effortMsg, projectMsg].filter(Boolean);
   let assistantText = '';
   let firstOutput = true;
+  let retries = 0;
+  const startMs = Date.now();
   let stopWaiting = makeWaitIndicator(`${ANSI.dim}(wartet auf Modell-Antwort)${ANSI.reset}`);
   try {
     const result = await sendChat({
-      config: activeConfig,
+      config: runConfig,
       messages: extraMessages.length ? [...extraMessages, ...messages] : messages,
-      tools: buildToolDefinitions(activeConfig.projectRoot),
-      maxTokens: effortMaxTokens(activeConfig.effort),
+      tools: buildToolDefinitions(runConfig.projectRoot),
+      maxTokens: effortMaxTokens(runConfig.effort),
       onChunk: (delta) => {
         if (firstOutput) { stopWaiting(true); firstOutput = false; }
         process.stdout.write(delta);
@@ -1621,13 +1644,21 @@ async function attemptChat(activeConfig) {
         return handleToolCall(toolCall);
       },
       onRetry: (...args) => {
+        retries++;
         stopWaiting(true);
         printRetry(...args);
         firstOutput = true;
         stopWaiting = makeWaitIndicator(`${ANSI.dim}(wartet auf Modell-Antwort)${ANSI.reset}`);
       },
     });
-    return { result, assistantText };
+    const isEmpty = !assistantText.trim();
+    recordAttempt(runConfig.activeModel, {
+      retries,
+      errored: isEmpty,
+      durationMs: Date.now() - startMs,
+      errorMessage: isEmpty ? 'leere Antwort (kein Text, kein Tool-Aufruf)' : '',
+    });
+    return { result, assistantText, isEmpty };
   } finally {
     stopWaiting(true);
   }
@@ -1704,21 +1735,30 @@ async function handleMessage(text) {
   await compactHistoryIfNeeded();
   messages.push({ role: 'user', content: text });
   try {
-    const { result, assistantText } = await attemptChat(config);
+    const { result, assistantText, isEmpty } = await attemptChat(config);
     messages.push({ role: 'assistant', content: assistantText });
     saveSession(messages);
     addUsage(result.usage);
     const usageSuffix = result.usage ? `, ${result.usage.prompt_tokens}+${result.usage.completion_tokens} Tokens` : '';
+    if (isEmpty) {
+      console.log(
+        `\n${ANSI.error}[Warnung] Modell hat weder Text noch weitere Tool-Aufrufe geliefert${describeEmptyChatTurn(result)} -- ` +
+          `moeglicher Modell-Aussetzer. Nachricht erneut senden oder /model wechseln.${ANSI.reset}`
+      );
+    }
     console.log(`\n${ANSI.dim}(${result.model} via ${result.provider}${usageSuffix})${ANSI.reset}\n`);
   } catch (err) {
     if (config.fallbackModel && config.fallbackModel !== config.activeModel) {
       console.log(`${ANSI.error}[Fallback] ${err.message || err} -- versuche Fallback-Modell "${config.fallbackModel}"...${ANSI.reset}`);
       try {
         const fallbackConfig = { ...config, activeModel: config.fallbackModel };
-        const { result, assistantText } = await attemptChat(fallbackConfig);
+        const { result, assistantText, isEmpty: fallbackEmpty } = await attemptChat(fallbackConfig);
         messages.push({ role: 'assistant', content: assistantText });
         saveSession(messages);
         addUsage(result.usage);
+        if (fallbackEmpty) {
+          console.log(`\n${ANSI.error}[Warnung] Fallback-Modell hat ebenfalls nichts geliefert${describeEmptyChatTurn(result)}.${ANSI.reset}`);
+        }
         console.log(`\n${ANSI.dim}(Fallback: ${result.model} via ${result.provider})${ANSI.reset}\n`);
         return;
       } catch (err2) {
