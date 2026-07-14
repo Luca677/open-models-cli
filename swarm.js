@@ -45,6 +45,36 @@ function speakerTag(name, text) {
   return `[${name}]: ${text}`;
 }
 
+// Auf Nutzerwunsch ("Modelle machen haeufig dieselben Fehler, sprechen sich wenig ab, sollen
+// sich staerker austauschen"): ein geteiltes, LIVE innerhalb eines Laufs gefuehrtes Protokoll
+// aller leeren/fehlgeschlagenen Zuege -- wird JEDEM nachfolgenden Zug (egal ob Worker,
+// Coordinator oder Swarm-Rolle) als System-Nachricht gezeigt. Kostet KEINEN zusaetzlichen
+// API-Aufruf (nutzt nur bereits vorhandene Fehlerdaten aus recordAttempt/describeEmptyTurn) --
+// ein separater "reflektiere ueber deinen Fehler"-Modellaufruf pro Zug waere doppelt so teuer
+// und bei den ohnehin schon unzuverlaessigen Gratis-Modellen keine verlaessliche Informations-
+// quelle. Automatisches, system-injiziertes Teilen ist zuverlaessiger als zu hoffen, dass ein
+// Modell proaktiv send_message benutzt. Gedeckelt (MISTAKE_LOG_CAP), damit die Nachricht bei
+// langen Laeufen nicht unbegrenzt waechst.
+const MISTAKE_LOG_CAP = 20;
+const MISTAKE_LOG_DISPLAY_LIMIT = 10;
+
+function pushMistake(mistakeLog, who, what) {
+  const trimmed = what.length > 200 ? `${what.slice(0, 200)}...` : what;
+  mistakeLog.push({ who, what: trimmed });
+  if (mistakeLog.length > MISTAKE_LOG_CAP) mistakeLog.shift();
+}
+
+function mistakesSystemMessage(mistakeLog) {
+  if (!mistakeLog.length) return null;
+  const lines = mistakeLog.slice(-MISTAKE_LOG_DISPLAY_LIMIT).map((m) => `- ${m.who}: ${m.what}`);
+  return {
+    role: 'system',
+    content:
+      `Bisherige Probleme in DIESEM Lauf (nicht wiederholen -- bei Bedarf Ansatz aendern oder ` +
+      `eine andere Rolle per send_message/dispatch_agents informieren):\n${lines.join('\n')}`,
+  };
+}
+
 // Macht eine leere Antwort (weder Text noch Tool-Aufruf) diagnostizierbar statt nur "moeglicher
 // Modell-Aussetzer" zu raten: finish_reason:"length" + reasoningChars>0 heisst konkret "Budget
 // ging fuers Denken drauf, bevor sichtbarer Output kam" (siehe SWARM_MAX_TOKENS-Kommentar oben).
@@ -159,7 +189,7 @@ function recommendBatchSize(config) {
 // Baum geteiltes { n } Objekt (per Referenz durchgereicht) -- liefert eindeutige Worker-IDs
 // (nicht nur pro Rollenname, siehe Kommentar bei workerSeq weiter unten) auch ueber mehrere
 // Verschachtelungsebenen hinweg.
-async function runWorkerNode({ config, role, task, depth, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter, onModelSwap = () => {}, runId = null, usageTotals = { promptTokens: 0, completionTokens: 0, calls: 0 } }) {
+async function runWorkerNode({ config, role, task, depth, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter, onModelSwap = () => {}, runId = null, usageTotals = { promptTokens: 0, completionTokens: 0, calls: 0 }, mistakeLog = [] }) {
   const workerId = `${role.name}#${counter.n++}`;
   // pickEffectiveModel VOR onWorkerStart, damit die Anzeige das TATSAECHLICH verwendete
   // (evtl. per Selbstdiagnose ersetzte) Modell zeigt statt immer role.model.
@@ -178,12 +208,14 @@ async function runWorkerNode({ config, role, task, depth, workerRoles, buildTool
   const startMs = Date.now();
   let chatResult = null;
   try {
+    const mistakesMsg = mistakesSystemMessage(mistakeLog);
     chatResult = await sendChat({
       config: workerConfig,
       messages: [
         { role: 'system', content: role.systemPrompt },
         fableSystemMessage(),
         ...(projectContext ? [{ role: 'system', content: projectContext }] : []),
+        ...(mistakesMsg ? [mistakesMsg] : []),
         { role: 'user', content: task },
       ],
       tools,
@@ -205,7 +237,7 @@ async function runWorkerNode({ config, role, task, depth, workerRoles, buildTool
             assignments.map((a) => {
               const subRole = workerRoles.find((r) => r.name === a.role);
               if (!subRole) return Promise.resolve({ role: a.role, label: a.role, error: `Rolle "${a.role}" nicht gefunden.` });
-              return runWorkerNode({ config, role: subRole, task: a.task, depth: depth + 1, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter, onModelSwap, runId, usageTotals });
+              return runWorkerNode({ config, role: subRole, task: a.task, depth: depth + 1, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter, onModelSwap, runId, usageTotals, mistakeLog });
             })
           );
           return subOutcomes
@@ -237,6 +269,7 @@ async function runWorkerNode({ config, role, task, depth, workerRoles, buildTool
     if (isEmpty) {
       const warning = `LEER: Modell hat weder Text noch Tool-Aufrufe geliefert${describeEmptyTurn(chatResult)}.`;
       trace.logEvent(runId, 'worker_empty', { workerId, role: role.name, model: effectiveModel, finishReason: chatResult?.finishReason, reasoningChars: chatResult?.reasoningChars });
+      pushMistake(mistakeLog, `${role.label} (${effectiveModel})`, warning);
       onWorkerDone(role, text, warning, workerId);
       return { role: role.name, label: role.label, error: warning };
     }
@@ -247,6 +280,7 @@ async function runWorkerNode({ config, role, task, depth, workerRoles, buildTool
     recordAttempt(effectiveModel, { retries: workerRetries, errored: true, durationMs: Date.now() - startMs, errorMessage: err.message || String(err) });
     const message = err.message || String(err);
     trace.logEvent(runId, 'worker_error', { workerId, role: role.name, model: effectiveModel, error: message });
+    pushMistake(mistakeLog, `${role.label} (${effectiveModel})`, `Fehler: ${message}`);
     onWorkerDone(role, '', message, workerId);
     return { role: role.name, label: role.label, error: message };
   }
@@ -270,6 +304,7 @@ const MAX_COORDINATOR_ATTEMPTS = 2;
 async function runHive({ config, task, coordinatorRole, workerRoles, buildToolDefinitions, onAgentStart, onChunk, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, onEmptyTurn = () => {}, onCoordinatorRetry = () => {}, onModelSwap = () => {}, projectContext = null, runId = trace.newRunId() }) {
   trace.logEvent(runId, 'hive_start', { task: task.slice(0, 300), maxDepth: effectiveHiveDepth(config) });
   const usageTotals = { promptTokens: 0, completionTokens: 0, calls: 0 };
+  const mistakeLog = [];
   const dispatchTool = buildDispatchTool(workerRoles, recommendBatchSize(config));
   // Coordinator bekommt volle Datei-Tools (er delegiert primaer, kann aber selbst nachschauen).
   const fileTools = buildToolDefinitions(config.projectRoot);
@@ -298,10 +333,12 @@ async function runHive({ config, task, coordinatorRole, workerRoles, buildToolDe
     onAgentStart({ ...coordinatorRole, model: effectiveModel });
 
     const coordinatorConfig = { ...config, activeModel: effectiveModel };
+    const mistakesMsg = mistakesSystemMessage(mistakeLog);
     const coordinatorMessages = [
       { role: 'system', content: coordinatorRole.systemPrompt },
       fableSystemMessage(),
       ...(projectContext ? [{ role: 'system', content: projectContext }] : []),
+      ...(mistakesMsg ? [mistakesMsg] : []),
       { role: 'user', content: `Team-Aufgabe: ${task}` },
     ];
     if (attempt > 1) {
@@ -344,7 +381,7 @@ async function runHive({ config, task, coordinatorRole, workerRoles, buildToolDe
             assignments.map((a) => {
               const role = workerRoles.find((r) => r.name === a.role);
               if (!role) return Promise.resolve({ role: a.role, label: a.role, error: `Rolle "${a.role}" nicht gefunden.` });
-              return runWorkerNode({ config, role, task: a.task, depth: 1, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter, onModelSwap, runId, usageTotals });
+              return runWorkerNode({ config, role, task: a.task, depth: 1, workerRoles, buildToolDefinitions, onWorkerStart, onWorkerDone, onFileToolCall, onRetry, projectContext, counter, onModelSwap, runId, usageTotals, mistakeLog });
             })
           );
 
@@ -377,11 +414,15 @@ async function runHive({ config, task, coordinatorRole, workerRoles, buildToolDe
         durationMs: Date.now() - startMs,
         errorMessage: isEmpty ? 'leere Antwort (kein Text, kein Tool-Aufruf)' : '',
       });
-      if (isEmpty) onEmptyTurn(coordinatorRole, describeEmptyTurn(result));
+      if (isEmpty) {
+        pushMistake(mistakeLog, `Coordinator (${effectiveModel})`, `LEER: ${describeEmptyTurn(result) || 'keine Antwort'}`);
+        onEmptyTurn(coordinatorRole, describeEmptyTurn(result));
+      }
     } catch (err) {
       // Nicht die ganze Hive abbrechen -- als leerer Zug behandeln (loest im naechsten
       // Versuch automatisch einen Modell-Wechsel aus, falls das Muster sich wiederholt).
       recordAttempt(effectiveModel, { retries: coordinatorRetries, errored: true, durationMs: Date.now() - startMs, errorMessage: err.message || String(err) });
+      pushMistake(mistakeLog, `Coordinator (${effectiveModel})`, `Fehler: ${err.message || String(err)}`);
       result = { finalText: '', usage: null, provider: '', model: effectiveModel };
       onEmptyTurn(coordinatorRole);
     }
@@ -391,6 +432,7 @@ async function runHive({ config, task, coordinatorRole, workerRoles, buildToolDe
   result.runId = runId;
   result.lastModel = lastEffectiveModel;
   result.usageTotals = usageTotals;
+  result.mistakeLog = mistakeLog;
   trace.logEvent(runId, 'hive_done', { dispatchHappened });
   return result;
 }
@@ -412,6 +454,7 @@ function maxTotalTurns(roleCount) {
 async function runSwarm({ config, task, roles, buildToolDefinitions, onAgentStart, onChunk, onNotice, onFileToolCall, onRetry, onEmptyTurn = () => {}, onModelSwap = () => {}, projectContext = null, runId = trace.newRunId() }) {
   trace.logEvent(runId, 'swarm_start', { task: task.slice(0, 300), roles: roles.map((r) => r.name) });
   const usageTotals = { promptTokens: 0, completionTokens: 0, calls: 0 };
+  const mistakeLog = [];
   const transcript = [{ role: 'user', content: `Team-Aufgabe: ${task}` }];
   const mailbox = {};
   const turnQueue = [...roles];
@@ -430,11 +473,13 @@ async function runSwarm({ config, task, roles, buildToolDefinitions, onAgentStar
     mailbox[role.name] = [];
 
     const styleMsg = styleSystemMessage(config.style);
+    const mistakesMsg = mistakesSystemMessage(mistakeLog);
     const roleMessages = [
       { role: 'system', content: role.systemPrompt },
       fableSystemMessage(),
       ...(projectContext ? [{ role: 'system', content: projectContext }] : []),
       ...(styleMsg ? [styleMsg] : []),
+      ...(mistakesMsg ? [mistakesMsg] : []),
       ...transcript,
       ...pending.map((m) => ({ role: 'user', content: speakerTag(`Nachricht von ${m.from}`, m.content) })),
       { role: 'user', content: `Du bist jetzt am Zug (Rolle: ${role.label}). Nutze die Datei-Tools falls fuer deine Rolle noetig.` },
@@ -450,6 +495,7 @@ async function runSwarm({ config, task, roles, buildToolDefinitions, onAgentStar
     const wakeups = new Set();
     const startMs = Date.now();
     let chatResult = null;
+    let caughtErrorMessage = null;
     try {
       chatResult = await sendChat({
         config: roleConfig,
@@ -502,12 +548,15 @@ async function runSwarm({ config, task, roles, buildToolDefinitions, onAgentStar
       // den Fehlschlag (fuehrt bei Wiederholung zum automatischen Modell-Wechsel).
       recordAttempt(effectiveModel, { retries: roleRetries, errored: true, durationMs: Date.now() - startMs, errorMessage: err.message || String(err) });
       trace.logEvent(runId, 'turn_error', { role: role.name, model: effectiveModel, error: err.message || String(err) });
+      caughtErrorMessage = err.message || String(err);
       finalText = '';
       toolCallHappened = false;
     }
 
     if (!finalText.trim() && !toolCallHappened) {
       trace.logEvent(runId, 'empty_turn', { role: role.name, model: effectiveModel, finishReason: chatResult?.finishReason, reasoningChars: chatResult?.reasoningChars });
+      const mistakeDetail = caughtErrorMessage ? `Fehler: ${caughtErrorMessage}` : `LEER: ${describeEmptyTurn(chatResult) || 'keine Antwort'}`;
+      pushMistake(mistakeLog, `${role.label} (${effectiveModel})`, mistakeDetail);
       onEmptyTurn(role, describeEmptyTurn(chatResult));
     }
 
@@ -526,6 +575,7 @@ async function runSwarm({ config, task, roles, buildToolDefinitions, onAgentStar
   trace.logEvent(runId, 'swarm_done', { turnsRun });
   transcript.runId = runId; // Arrays sind Objekte -- zusaetzliches Feld stoert Index/length/Iteration nicht.
   transcript.usageTotals = usageTotals;
+  transcript.mistakeLog = mistakeLog;
   return transcript;
 }
 

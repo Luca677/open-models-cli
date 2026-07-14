@@ -107,13 +107,33 @@ function buildCodemap(root) {
     .slice(0, 15)
     .map(([ext, count]) => `  ${ext.padEnd(16)} ${count}`);
 
+  const graphifyInsights = extractGraphifyInsights(root);
+
   return [
     `Wurzel: ${root}`,
     `Top-Level: ${topLevel.join(', ') || '(leer)'}`,
     `Dateien gesamt: ${totalFiles} (node_modules/.git/dist/build/__pycache__/venv uebersprungen)`,
     'Nach Endung:',
     ...extLines,
+    ...(graphifyInsights ? ['', '--- graphify-Erkenntnisse (graphify-out/GRAPH_REPORT.md gefunden) ---', graphifyInsights] : []),
   ].join('\n');
+}
+
+// Auf Nutzerwunsch (offener Punkt aus der ersten Verbesserungsrunde, "Selbst-Wissen nutzen"):
+// falls dieses Projekt schonmal per /graphify analysiert wurde, die God-Nodes-Sektion des
+// Reports mit in /codemap einblenden -- zeigt auf einen Blick, welche Dateien/Funktionen am
+// staerksten gekoppelt sind, ohne dass graphify (separates, schwereres Skill) erneut laufen
+// muss. Rein optional: existiert kein Report, bleibt /codemap unveraendert wie bisher.
+function extractGraphifyInsights(root) {
+  let lines;
+  try {
+    lines = fs.readFileSync(path.join(root, 'graphify-out', 'GRAPH_REPORT.md'), 'utf-8').split('\n');
+  } catch {
+    return null;
+  }
+  const startIdx = lines.findIndex((l) => /god nodes/i.test(l));
+  if (startIdx === -1) return null;
+  return lines.slice(startIdx, startIdx + 13).join('\n').trim();
 }
 
 const ANSI = {
@@ -232,6 +252,24 @@ function addUsageTotals(totals) {
   sessionUsage.promptTokens += totals.promptTokens;
   sessionUsage.completionTokens += totals.completionTokens;
   sessionUsage.calls += totals.calls;
+}
+
+// Auf Nutzerwunsch ("Modelle machen haeufig dieselben Fehler, sprechen sich wenig ab"):
+// swarm.js' mistakeLog (leere/fehlgeschlagene Zuege innerhalb EINES Laufs) wird dedupliziert
+// und in AGENTS_MEMORY.md als Lektion gespeichert -- damit ein KUENFTIGER Lauf (auch in einer
+// neuen Session oder dem naechsten /hive loop-Durchlauf) beim Start bereits weiss, was schon
+// schiefging, statt es blind zu wiederholen.
+function formatLessons(mistakeLog) {
+  if (!mistakeLog || !mistakeLog.length) return undefined;
+  const seen = new Set();
+  const lessons = [];
+  for (const m of mistakeLog) {
+    const line = `${m.who}: ${m.what}`;
+    if (seen.has(line)) continue;
+    seen.add(line);
+    lessons.push(line);
+  }
+  return lessons.slice(-10);
 }
 
 // Scope-Warnung: reine Beobachtung, kein Blocker -- viele veraenderte Dateien in einer
@@ -874,6 +912,7 @@ async function handleCommand(line) {
         task,
         files: newFiles,
         summary: lastMsg ? shorten(lastMsg.content, 500) : '(keine Textzusammenfassung)',
+        lessons: formatLessons(transcript.mistakeLog),
       });
     } catch (err) {
       stopWaiting(true);
@@ -1287,6 +1326,7 @@ async function runSwarmCommand(task, opts = {}) {
       task,
       files: newFiles,
       summary: lastMsg ? shorten(lastMsg.content, 500) : '(keine Textzusammenfassung)',
+      lessons: formatLessons(transcript.mistakeLog),
     });
   } catch (err) {
     stopWaiting(true);
@@ -1446,6 +1486,7 @@ async function runHiveCommand(task, opts = {}) {
         task,
         files: newFiles,
         summary: shorten(finalSummary, 500),
+        lessons: formatLessons(result.mistakeLog),
       });
     }
   } catch (err) {

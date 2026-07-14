@@ -151,6 +151,35 @@ probiert. Zustand liegt in `key-health.json` (Key nur als Hash, nie im Klartext)
 gleichzeitig laufende CLI-Instanzen sich denselben Key-Pool teilen, ohne sich gegenseitig zu
 ueberschreiben.
 
+## Geteiltes Fehler-Gedaechtnis, staerkerer Austausch zwischen Rollen (5. Runde)
+
+Auf Nutzerwunsch: "Modelle machen haeufig dieselben Fehler, sprechen sich wenig ab, sollten
+mehr nachdenken und sich sehr stark austauschen -- Qualitaet soll sich nach oben drehen, nicht
+nach unten." Umgesetzt als geteiltes, LIVE gefuehrtes Fehler-Protokoll statt eines zusaetzlichen
+kostenpflichtigen "reflektiere ueber deinen Fehler"-Modellaufrufs pro Zug:
+
+**Intra-Lauf (swarm.js, `mistakeLog`):** jeder leere oder fehlgeschlagene Zug (Worker,
+Coordinator, Swarm-Rolle, auf jeder Verschachtelungstiefe) wird automatisch in einem geteilten
+Array gesammelt (analog zum bestehenden `usageTotals`/`counter`-Referenz-Muster) und JEDEM
+nachfolgenden Zug in DIESEM Lauf als System-Nachricht gezeigt ("Bisherige Probleme in DIESEM
+Lauf -- nicht wiederholen"). Kostet keinen zusaetzlichen API-Aufruf -- nutzt nur bereits
+vorhandene Fehlerdaten. Automatisches, system-injiziertes Teilen ist zuverlaessiger als zu
+hoffen, dass ein Modell proaktiv `send_message` benutzt (dessen Beschreibung zusaetzlich auf
+diese Moeglichkeit hinweist). Gedeckelt bei 20 Eintraegen / 10 angezeigten, damit die Nachricht
+bei langen Laeufen nicht unbegrenzt waechst.
+
+**Cross-Lauf (memory.js, `AGENTS_MEMORY.md`):** `appendProjectMemory` bekommt ein neues
+optionales `lessons`-Feld -- die deduplizierten Eintraege aus `mistakeLog` landen als
+**Lektionen:**-Block im Speicher-Eintrag jedes Laufs. Ein KUENFTIGER Lauf (neue Session oder
+naechster `/hive loop`-Durchlauf) sieht das ueber die bereits bestehende `searchProjectMemory`-
+Suche automatisch beim Start -- die "Gedankenspirale nach oben": jeder Zug/Lauf weiss strikt
+mehr als der vorherige, was schonmal schiefging, statt es blind zu wiederholen.
+
+**Selbst-Wissen (`/codemap`):** offener Punkt aus der 4. Runde -- falls `graphify-out/
+GRAPH_REPORT.md` unter dem Projekt-Ordner existiert, blendet `/codemap` jetzt die God-Nodes-
+Sektion mit ein (welche Dateien/Funktionen am staerksten gekoppelt sind). Rein optional, kein
+Aufruf des (separaten, schwereren) `/graphify`-Skills noetig.
+
 ## Kosten-Sichtbarkeit, Terminal-UX, smarteres Routing (4. Runde)
 
 Auf Nutzerwunsch nach einer weiteren "grossen Verbesserungsrunde" -- 3 Themenbloecke priorisiert

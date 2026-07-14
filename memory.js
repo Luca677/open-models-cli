@@ -23,15 +23,24 @@ function loadProjectMemory(root) {
   }
 }
 
-// entry: { task: string, files: string[], summary: string }
+// entry: { task: string, files: string[], summary: string, lessons?: string[] }
+// lessons: auf Nutzerwunsch ("Modelle machen haeufig dieselben Fehler, sprechen sich wenig
+// ab") -- was in DIESEM Lauf schiefging (leere Zuege, Fehler), damit ein KUENFTIGER Lauf
+// (auch in einer neuen Session/einem neuen Loop-Durchlauf) es nicht blind wiederholt.
+// Kommt aus swarm.js' mistakeLog (siehe dort), nicht aus einer separaten Selbstkritik-Anfrage
+// -- kostet also keinen zusaetzlichen API-Aufruf.
 function appendProjectMemory(root, entry) {
   const timestamp = new Date().toISOString();
   const filesLine = entry.files && entry.files.length ? entry.files.join(', ') : '(keine erkannten Datei-Aenderungen)';
+  const lessonsBlock = entry.lessons && entry.lessons.length
+    ? `**Lektionen:**\n${entry.lessons.map((l) => `- ${l}`).join('\n')}\n`
+    : '';
   const block =
     `## ${timestamp}\n` +
     `**Aufgabe:** ${entry.task}\n` +
     `**Dateien:** ${filesLine}\n` +
-    `**Ergebnis:** ${entry.summary}\n`;
+    `**Ergebnis:** ${entry.summary}\n` +
+    lessonsBlock;
 
   const existing = loadProjectMemory(root) || '';
   let combined = existing ? existing.trimEnd() + ENTRY_SEPARATOR + block : block;
